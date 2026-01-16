@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "endstone-fortcore"
+version = "1.0.0"
+description = "High-performance PvP Core plugin for Endstone Bedrock servers"
+authors = [
+    {name = "Your Name", email = "your.email@example.com"}
+]
+requires-python = ">=3.9"
+dependencies = [
+    "endstone>=0.5.0",
+    "pyyaml>=6.0"
+]
+
+[project.entry-points."endstone"]
+fortcore = "endstone_fortcore:FortCore"
+
+[project.readme]
+file = "README.md"
+content-type = "text/markdown"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/endstone_fortcore"]
