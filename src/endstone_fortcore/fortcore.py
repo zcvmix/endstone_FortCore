@@ -8,12 +8,11 @@ from endstone import ColorFormat, GameMode
 from endstone.form import ActionForm
 import yaml
 import csv
-import os
 from pathlib import Path
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
-import uuid as uuid_lib
+import uuid
 
 class GameState(Enum):
     """Player game states"""
@@ -48,25 +47,10 @@ class PlayerData:
 class FortCore(Plugin):
     api_version = "0.5"
     
-    commands = {
-        "out": {
-            "description": "Leave the current match and return to lobby",
-            "usages": ["/out"],
-            "permissions": ["fortcore.command.out"],
-        }
-    }
-    
-    permissions = {
-        "fortcore.command.out": {
-            "description": "Allow players to leave matches",
-            "default": True,
-        }
-    }
-    
     def __init__(self):
         super().__init__()
         self.player_data: Dict[str, PlayerData] = {}
-        self.config: Dict = {}
+        self.plugin_config: Dict = {}  # Changed from self.config
         self.teleport_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
@@ -74,11 +58,14 @@ class FortCore(Plugin):
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
-        self.load_config()
+        self.load_plugin_config()  # Changed method name
         
     def on_enable(self) -> None:
         self.logger.info("FortCore enabled!")
         self.register_events(self)
+        
+        # Register command
+        self.register_command()
         
         # Create rollback directory
         self.rollback_dir = Path(self.data_folder) / "rollbacks"
@@ -89,7 +76,7 @@ class FortCore(Plugin):
             self, self.flush_all_buffers, delay=1200, period=1200
         )
         
-        self.logger.info(f"Loaded {len(self.config.get('maps', []))} maps and {len(self.config.get('kits', []))} kits")
+        self.logger.info(f"Loaded {len(self.plugin_config.get('maps', []))} maps and {len(self.plugin_config.get('kits', []))} kits")
         
     def on_disable(self) -> None:
         self.logger.info("FortCore disabling...")
@@ -98,8 +85,18 @@ class FortCore(Plugin):
             self.server.scheduler.cancel_task(self.flush_task)
         for task_id in self.rollback_tasks.values():
             self.server.scheduler.cancel_task(task_id)
+    
+    def register_command(self) -> None:
+        """Register the /out command"""
+        try:
+            command = self.get_command("out")
+            if command:
+                command.executor = self
+                self.logger.info("Registered /out command")
+        except Exception as e:
+            self.logger.error(f"Failed to register command: {e}")
         
-    def load_config(self) -> None:
+    def load_plugin_config(self) -> None:  # Renamed from load_config
         """Load configuration from config.yml"""
         config_path = Path(self.data_folder) / "config.yml"
         
@@ -131,10 +128,10 @@ class FortCore(Plugin):
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
                 yaml.dump(default_config, f, default_flow_style=False)
-            self.config = default_config
+            self.plugin_config = default_config  # Changed
         else:
             with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
+                self.plugin_config = yaml.safe_load(f)  # Changed
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -157,7 +154,7 @@ class FortCore(Plugin):
             inventory.clear()
             
             # Teleport to lobby
-            lobby = self.config.get("lobby_spawn", {})
+            lobby = self.plugin_config.get("lobby_spawn", {})  # Changed
             level = self.server.get_level(lobby.get("world", "world"))
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
@@ -212,7 +209,7 @@ class FortCore(Plugin):
         form = ActionForm()
         form.title = "FortCore"
         
-        kits = self.config.get("kits", [])
+        kits = self.plugin_config.get("kits", [])  # Changed
         
         for i, kit in enumerate(kits):
             online_count = sum(1 for pd in self.player_data.values() 
@@ -229,8 +226,8 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        kits = self.config.get("kits", [])
-        maps = self.config.get("maps", [])
+        kits = self.plugin_config.get("kits", [])  # Changed
+        maps = self.plugin_config.get("maps", [])  # Changed
         
         if kit_index >= len(kits) or kit_index >= len(maps):
             player.send_message(f"{ColorFormat.RED}Invalid selection!{ColorFormat.RESET}")
@@ -496,7 +493,7 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            level = self.server.get_level(self.config.get("lobby_spawn", {}).get("world", "world"))
+            level = self.server.get_level(self.plugin_config.get("lobby_spawn", {}).get("world", "world"))  # Changed
             if not level:
                 return
             
@@ -529,7 +526,8 @@ class FortCore(Plugin):
         data.current_kit = None
         data.current_map = None
         
-        player = self.server.get_player(uuid_lib.UUID(player_uuid))
+        # Use standard uuid.UUID instead of uuid_lib.UUID
+        player = self.server.get_player(uuid.UUID(player_uuid))
         if player:
             self.reset_player(player)
         
