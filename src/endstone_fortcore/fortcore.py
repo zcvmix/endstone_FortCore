@@ -66,7 +66,8 @@ class FortCore(Plugin):
     def __init__(self):
         super().__init__()
         self.player_data: Dict[str, PlayerData] = {}
-        self.config: Dict = {}
+        # RENAMED: self.config -> self.plugin_config to avoid conflict with parent Plugin.config
+        self.plugin_config: Dict = {} 
         self.teleport_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
@@ -89,7 +90,8 @@ class FortCore(Plugin):
             self, self.flush_all_buffers, delay=1200, period=1200
         )
         
-        self.logger.info(f"Loaded {len(self.config.get('maps', []))} maps and {len(self.config.get('kits', []))} kits")
+        # UPDATED REFERENCE
+        self.logger.info(f"Loaded {len(self.plugin_config.get('maps', []))} maps and {len(self.plugin_config.get('kits', []))} kits")
         
     def on_disable(self) -> None:
         self.logger.info("FortCore disabling...")
@@ -131,10 +133,12 @@ class FortCore(Plugin):
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
                 yaml.dump(default_config, f, default_flow_style=False)
-            self.config = default_config
+            # UPDATED REFERENCE
+            self.plugin_config = default_config
         else:
             with open(config_path, 'r') as f:
-                self.config = yaml.safe_load(f)
+                # UPDATED REFERENCE
+                self.plugin_config = yaml.safe_load(f)
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -157,7 +161,8 @@ class FortCore(Plugin):
             inventory.clear()
             
             # Teleport to lobby
-            lobby = self.config.get("lobby_spawn", {})
+            # UPDATED REFERENCE
+            lobby = self.plugin_config.get("lobby_spawn", {})
             level = self.server.get_level(lobby.get("world", "world"))
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
@@ -212,7 +217,8 @@ class FortCore(Plugin):
         form = ActionForm()
         form.title = "FortCore"
         
-        kits = self.config.get("kits", [])
+        # UPDATED REFERENCE
+        kits = self.plugin_config.get("kits", [])
         
         for i, kit in enumerate(kits):
             online_count = sum(1 for pd in self.player_data.values() 
@@ -229,8 +235,9 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        kits = self.config.get("kits", [])
-        maps = self.config.get("maps", [])
+        # UPDATED REFERENCES
+        kits = self.plugin_config.get("kits", [])
+        maps = self.plugin_config.get("maps", [])
         
         if kit_index >= len(kits) or kit_index >= len(maps):
             player.send_message(f"{ColorFormat.RED}Invalid selection!{ColorFormat.RESET}")
@@ -496,7 +503,8 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            level = self.server.get_level(self.config.get("lobby_spawn", {}).get("world", "world"))
+            # UPDATED REFERENCE
+            level = self.server.get_level(self.plugin_config.get("lobby_spawn", {}).get("world", "world"))
             if not level:
                 return
             
