@@ -4,10 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "endstone-fortcore"
-version = "1.0.0"
+version = "1.1.0"
 description = "High-performance PvP Core plugin for Endstone Bedrock servers"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Admin", email = "admin@example.com"}
 ]
 requires-python = ">=3.9"
 dependencies = [
@@ -24,3 +24,8 @@ content-type = "text/markdown"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/endstone_fortcore"]
+
+# --- COMMAND REGISTRATION ---
+[endstone_fortcore]
+commands = { out = { description = "Leave the current match", permissions = ["fortcore.command.out"] } }
+permissions = { "fortcore.command.out" = { description = "Allow leaving matches", default = true } }
