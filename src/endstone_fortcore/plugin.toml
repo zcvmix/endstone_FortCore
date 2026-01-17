@@ -7,8 +7,8 @@ api-version = "0.5"
 
 [commands.out]
 description = "Leave the current match and return to lobby"
-usages = ["/out"]
-permissions = ["fortcore.command.out"]
+usage = ["/out"]
+permission = ["fortcore.command.out"]
 
 [permissions]
 "fortcore.command.out" = { description = "Allow players to leave matches", default = true }
