@@ -88,11 +88,19 @@ class FortCore(Plugin):
             self.server.scheduler.cancel_task(task_id)
     
     def register_command(self) -> None:
-        """Register the /out command"""
+        """Register the /out command with permission for all players"""
         try:
+            # Get the command
             command = self.get_command("out")
             if command:
                 command.executor = self
+                
+                # Create permission for the command (accessible to everyone)
+                perm = self.server.plugin_manager.add_permission("fortcore.command.out")
+                if perm:
+                    perm.description = "Allow players to leave matches"
+                    perm.default = True  # Make it available to all players
+                
                 self.logger.info("Registered /out command")
         except Exception as e:
             self.logger.error(f"Failed to register command: {e}")
@@ -200,7 +208,7 @@ class FortCore(Plugin):
     def on_player_interact(self, event: PlayerInteractEvent) -> None:
         """Handle compass click to open menu"""
         player = event.player
-        item = player.inventory.item_in_hand
+        item = player.inventory.item_in_main_hand
         
         if item and item.type == "minecraft:lodestone_compass":
             self.open_kit_menu(player)
@@ -384,7 +392,7 @@ class FortCore(Plugin):
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent) -> None:
         """Handle player death"""
-        player = event.entity
+        player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
