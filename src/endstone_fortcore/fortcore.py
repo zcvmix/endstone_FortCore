@@ -230,21 +230,16 @@ class FortCore(Plugin):
                 pass
             
             lobby = self.plugin_config.get("lobby_spawn", {})
-            world_name = lobby.get("world", "world")
             
-            try:
-                level = self.server.get_world(world_name)
-            except:
-                try:
-                    level = player.location.dimension
-                except:
-                    try:
-                        level = self.server.worlds[0] if self.server.worlds else None
-                    except:
-                        level = None
+            # Always use player's current dimension
+            dimension = player.location.dimension
+            x = float(lobby.get("x", 0))
+            y = float(lobby.get("y", 100))
+            z = float(lobby.get("z", 0))
             
-            if level:
-                player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
+            from endstone import Location
+            new_location = Location(dimension, x, y, z)
+            player.teleport(new_location)
             
             from endstone.inventory import ItemStack
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
@@ -376,29 +371,16 @@ class FortCore(Plugin):
         player.inventory.clear()
         
         spawn = map_data.get("spawn", {})
-        world_name = map_data.get("world", "world")
         
-        try:
-            level = self.server.get_world(world_name)
-        except:
-            try:
-                level = player.location.dimension
-                self.logger.warning(f"World '{world_name}' not found, using current dimension")
-            except:
-                try:
-                    level = self.server.worlds[0] if self.server.worlds else None
-                except:
-                    level = None
+        # Always use player's current dimension
+        dimension = player.location.dimension
+        x = float(spawn.get("x", 0))
+        y = float(spawn.get("y", 64))
+        z = float(spawn.get("z", 0))
         
-        if level:
-            x = float(spawn.get("x", 0))
-            y = float(spawn.get("y", 64))
-            z = float(spawn.get("z", 0))
-            player.teleport(level, x, y, z)
-        else:
-            player.send_message(f"{ColorFormat.RED}Failed to teleport!{ColorFormat.RESET}")
-            data.state = GameState.LOBBY
-            return
+        from endstone import Location
+        new_location = Location(dimension, x, y, z)
+        player.teleport(new_location)
         
         data.state = GameState.MATCH
         data.current_kit = kit.get("name")
