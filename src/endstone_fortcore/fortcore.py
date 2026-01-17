@@ -43,6 +43,7 @@ class PlayerData:
         self.last_flush = datetime.now().timestamp()
         self.current_map: Optional[str] = None
         self.current_kit: Optional[str] = None
+        self.pending_rollback_actions: List[Dict] = []
 
 class FortCore(Plugin):
     api_version = "0.5"
@@ -72,7 +73,7 @@ class FortCore(Plugin):
         self.rollback_dir.mkdir(parents=True, exist_ok=True)
         
         # Start flush task every 60 seconds (1200 ticks)
-        self.flush_task = self.server.scheduler.run_task_timer(
+        self.flush_task = self.server.scheduler.run_task(
             self, self.flush_all_buffers, delay=1200, period=1200
         )
         
@@ -444,9 +445,11 @@ class FortCore(Plugin):
         if data.csv_path and data.csv_path.exists():
             actions = self.read_rollback_csv(data.csv_path)
             if actions:
-                task_id = self.server.scheduler.run_task_timer(
+                # Store actions in player data so the task can access them
+                data.pending_rollback_actions = actions
+                task_id = self.server.scheduler.run_task(
                     self, 
-                    lambda: self.process_rollback_batch(player_uuid, actions),
+                    lambda: self.process_rollback_batch(player_uuid),
                     delay=10,
                     period=10
                 )
@@ -468,8 +471,11 @@ class FortCore(Plugin):
             self.logger.error(f"Error reading CSV: {e}")
         return actions
     
-    def process_rollback_batch(self, player_uuid: str, actions: List[Dict]) -> None:
+    def process_rollback_batch(self, player_uuid: str) -> None:
         """Process 2 rollback actions every 0.5 seconds"""
+        data = self.get_player_data(player_uuid)
+        actions = data.pending_rollback_actions
+        
         if not actions:
             self.finish_rollback(player_uuid)
             return
@@ -522,6 +528,7 @@ class FortCore(Plugin):
                 self.logger.error(f"Error deleting CSV: {e}")
         
         data.rollback_buffer.clear()
+        data.pending_rollback_actions.clear()
         data.csv_path = None
         data.current_kit = None
         data.current_map = None
