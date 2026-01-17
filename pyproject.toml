@@ -11,7 +11,7 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "endstone>=0.5.0",
+    "endstone>=0.10.18",
     "pyyaml>=6.0"
 ]
 
@@ -29,3 +29,4 @@ packages = ["src/endstone_fortcore"]
 [endstone_fortcore]
 commands = { out = { description = "Leave the current match", permissions = ["fortcore.command.out"] } }
 permissions = { "fortcore.command.out" = { description = "Allow leaving matches", default = true } }
+
