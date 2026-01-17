@@ -165,8 +165,21 @@ class FortCore(Plugin):
             inventory.clear()
             
             # Teleport to lobby
-            lobby = self.plugin_config.get("lobby_spawn", {})  # Changed
-            level = self.server.get_level(lobby.get("world", "world"))
+            lobby = self.plugin_config.get("lobby_spawn", {})
+            world_name = lobby.get("world", "world")
+            
+            # Get world - try different methods
+            try:
+                level = self.server.get_world(world_name)
+            except:
+                try:
+                    # Fallback to worlds list
+                    level = next((w for w in self.server.worlds if w.name == world_name), None)
+                    if not level:
+                        level = self.server.worlds[0] if self.server.worlds else None
+                except:
+                    level = None
+            
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
             
@@ -221,27 +234,27 @@ class FortCore(Plugin):
     
     def open_kit_menu(self, player) -> None:
         """Open the kit selection menu"""
-        from endstone.form import Button
-        
         form = ActionForm()
         form.title = "FortCore"
         
-        kits = self.plugin_config.get("kits", [])  # Changed
+        kits = self.plugin_config.get("kits", [])
         
-        buttons = []
+        # Store callbacks in a list to avoid lambda capture issues
+        callbacks = []
+        
         for i, kit in enumerate(kits):
             online_count = sum(1 for pd in self.player_data.values() 
                              if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
             max_players = kit.get("maxPlayers", 8)
             
             button_text = f"{kit.get('name', 'Unknown')} [{online_count}/{max_players}]"
-            # Create button with on_click callback that captures the index
-            button = Button(button_text, on_click=lambda p, idx=i: self.handle_kit_select(p, idx))
-            buttons.append(button)
-        
-        # Add all buttons to form
-        for button in buttons:
-            form.add_button(button)
+            
+            # Create callback that captures index properly
+            def make_callback(idx):
+                return lambda p: self.handle_kit_select(p, idx)
+            
+            callbacks.append(make_callback(i))
+            form.add_button(button_text, on_click=callbacks[-1])
         
         form.send(player)
     
@@ -298,7 +311,19 @@ class FortCore(Plugin):
         
         # Teleport to map spawn
         spawn = map_data.get("spawn", {})
-        level = self.server.get_level(map_data.get("world", "world"))
+        world_name = map_data.get("world", "world")
+        
+        # Get world
+        try:
+            level = self.server.get_world(world_name)
+        except:
+            try:
+                level = next((w for w in self.server.worlds if w.name == world_name), None)
+                if not level:
+                    level = self.server.worlds[0] if self.server.worlds else None
+            except:
+                level = None
+        
         if level:
             player.teleport(level, spawn.get("x", 0), spawn.get("y", 64), spawn.get("z", 0))
         
@@ -522,7 +547,19 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            level = self.server.get_level(self.plugin_config.get("lobby_spawn", {}).get("world", "world"))  # Changed
+            world_name = self.plugin_config.get("lobby_spawn", {}).get("world", "world")
+            
+            # Get world
+            try:
+                level = self.server.get_world(world_name)
+            except:
+                try:
+                    level = next((w for w in self.server.worlds if w.name == world_name), None)
+                    if not level:
+                        level = self.server.worlds[0] if self.server.worlds else None
+                except:
+                    level = None
+            
             if not level:
                 return
             
