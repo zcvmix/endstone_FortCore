@@ -12,7 +12,7 @@ from pathlib import Path
 from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
-import uuid
+import uuid as uuid_module
 
 class GameState(Enum):
     """Player game states"""
@@ -55,7 +55,7 @@ class FortCore(Plugin):
         self.teleport_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
-        self.rollback_tasks: Dict[str, int] = {}
+        self.rollback_tasks: Dict[str, int] = {}  # Stores task IDs (int), not Task objects
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
@@ -72,6 +72,11 @@ class FortCore(Plugin):
         self.rollback_dir = Path(self.data_folder) / "rollbacks"
         self.rollback_dir.mkdir(parents=True, exist_ok=True)
         
+        # Resume any incomplete rollbacks from previous session
+        self.server.scheduler.run_task(
+            self, self.resume_incomplete_rollbacks, delay=40
+        )
+        
         # Start flush task every 60 seconds (1200 ticks)
         self.flush_task = self.server.scheduler.run_task(
             self, self.flush_all_buffers, delay=1200, period=1200
@@ -84,8 +89,74 @@ class FortCore(Plugin):
         self.flush_all_buffers()
         if self.flush_task:
             self.server.scheduler.cancel_task(self.flush_task)
-        for task_id in self.rollback_tasks.values():
-            self.server.scheduler.cancel_task(task_id)
+        for task_id in list(self.rollback_tasks.values()):
+            try:
+                self.server.scheduler.cancel_task(task_id)
+            except:
+                pass
+    
+    def resume_incomplete_rollbacks(self) -> None:
+        """Resume any incomplete rollbacks from server restart"""
+        try:
+            if not self.rollback_dir.exists():
+                return
+            
+            csv_files = list(self.rollback_dir.glob("rollback_*.csv"))
+            
+            if not csv_files:
+                return
+            
+            self.logger.info(f"Found {len(csv_files)} incomplete rollback(s) from previous session")
+            
+            for csv_file in csv_files:
+                try:
+                    # Extract UUID from filename: rollback_<uuid>.csv
+                    uuid_str = csv_file.stem.replace("rollback_", "")
+                    
+                    # Check if file has content (more than just header)
+                    with open(csv_file, 'r') as f:
+                        lines = f.readlines()
+                    
+                    if len(lines) <= 1:
+                        # Only header or empty, safe to delete
+                        csv_file.unlink()
+                        self.logger.info(f"Deleted empty rollback file: {csv_file.name}")
+                        continue
+                    
+                    # File has actions, resume rollback
+                    self.logger.info(f"Resuming rollback for player {uuid_str}")
+                    
+                    # Get or create player data
+                    data = self.get_player_data(uuid_str)
+                    data.csv_path = csv_file
+                    data.state = GameState.ROLLBACK
+                    
+                    # Read and start rollback
+                    actions = self.read_rollback_csv(csv_file)
+                    if actions:
+                        data.pending_rollback_actions = actions
+                        task_id = self.server.scheduler.run_task(
+                            self, 
+                            lambda uid=uuid_str: self.process_rollback_batch(uid),
+                            delay=10,
+                            period=10
+                        )
+                        self.rollback_tasks[uuid_str] = task_id
+                    else:
+                        # No valid actions, just delete
+                        csv_file.unlink()
+                        self.logger.info(f"Deleted invalid rollback file: {csv_file.name}")
+                        
+                except Exception as e:
+                    self.logger.error(f"Error processing {csv_file.name}: {e}")
+                    # If error, try to delete the file
+                    try:
+                        csv_file.unlink()
+                    except:
+                        pass
+                        
+        except Exception as e:
+            self.logger.error(f"Error during rollback resume: {e}")
     
     def register_command(self) -> None:
         """Register the /out command with permission for all players"""
@@ -147,18 +218,64 @@ class FortCore(Plugin):
         return self.player_data[player_uuid]
     
     def reset_player(self, player) -> None:
-        """Complete player reset"""
+        """Complete player reset - ALWAYS brings player back to lobby state"""
         try:
+            player_uuid = str(player.unique_id)
+            data = self.get_player_data(player_uuid)
+            
+            # Do NOT cancel rollback tasks - let them complete naturally
+            # Only clean up if rollback is fully done
+            if data.state != GameState.ROLLBACK:
+                if player_uuid in self.rollback_tasks:
+                    try:
+                        self.server.scheduler.cancel_task(self.rollback_tasks[player_uuid])
+                        del self.rollback_tasks[player_uuid]
+                    except:
+                        pass
+            
+            # Clean up rollback data only if not actively rolling back
+            if data.state != GameState.ROLLBACK:
+                if data.csv_path and data.csv_path.exists():
+                    try:
+                        data.csv_path.unlink()
+                    except:
+                        pass
+                
+                data.rollback_buffer.clear()
+                data.pending_rollback_actions.clear()
+                data.csv_path = None
+                data.current_kit = None
+                data.current_map = None
+            
+            data.state = GameState.LOBBY
+            
+            # Reset game mode
             player.game_mode = GameMode.SURVIVAL
             
+            # Clear effects
             try:
                 self.server.dispatch_command(self.server.command_sender, f'effect "{player.name}" clear')
             except:
                 pass
             
+            # Clear inventory completely
             inventory = player.inventory
             inventory.clear()
             
+            # Get armor inventory and clear it
+            try:
+                for i in range(4):  # Helmet, chestplate, leggings, boots
+                    inventory.set_armor_contents(i, None)
+            except:
+                pass
+            
+            # Clear offhand
+            try:
+                inventory.set_item_in_off_hand(None)
+            except:
+                pass
+            
+            # Teleport to lobby
             lobby = self.plugin_config.get("lobby_spawn", {})
             world_name = lobby.get("world", "world")
             
@@ -175,10 +292,12 @@ class FortCore(Plugin):
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
             
+            # Give menu item in slot 9 (index 8)
             from endstone.inventory import ItemStack
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
             inventory.set_item(8, menu_item)
             
+            # Apply weakness effect
             try:
                 self.server.dispatch_command(
                     self.server.command_sender,
@@ -192,8 +311,25 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent) -> None:
-        """Handle player join"""
+        """Handle player join - always reset to ensure clean state"""
         player = event.player
+        player_uuid = str(player.unique_id)
+        
+        # Check if player has an ongoing rollback
+        data = self.get_player_data(player_uuid)
+        if data.state == GameState.ROLLBACK:
+            # Don't interrupt rollback, just notify
+            self.logger.info(f"Player {player.name} joined during rollback - will reset when complete")
+        else:
+            # No rollback, safe to clean up
+            csv_path = self.rollback_dir / f"rollback_{player_uuid}.csv"
+            if csv_path.exists():
+                try:
+                    csv_path.unlink()
+                except:
+                    pass
+        
+        # Schedule reset with delay
         self.server.scheduler.run_task(
             self, lambda: self.handle_join_sequence(player), delay=10
         )
@@ -203,11 +339,13 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        self.reset_player(player)
-        data.state = GameState.LOBBY
-        
-        player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
-        player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to join a match!{ColorFormat.RESET}")
+        # Only reset if not rolling back
+        if data.state != GameState.ROLLBACK:
+            self.reset_player(player)
+            player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
+            player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to join a match!{ColorFormat.RESET}")
+        else:
+            player.send_message(f"{ColorFormat.YELLOW}Your previous session is being cleaned up...{ColorFormat.RESET}")
     
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent) -> None:
@@ -216,6 +354,17 @@ class FortCore(Plugin):
         item = player.inventory.item_in_main_hand
         
         if item and item.type == "minecraft:lodestone_compass":
+            player_uuid = str(player.unique_id)
+            data = self.get_player_data(player_uuid)
+            
+            # Only allow menu in LOBBY state
+            if data.state != GameState.LOBBY:
+                if data.state == GameState.ROLLBACK:
+                    player.send_message(f"{ColorFormat.YELLOW}Please wait, cleaning up your previous session...{ColorFormat.RESET}")
+                else:
+                    player.send_message(f"{ColorFormat.RED}You must be in the lobby to use this!{ColorFormat.RESET}")
+                return
+            
             self.open_kit_menu(player)
     
     def open_kit_menu(self, player) -> None:
@@ -256,16 +405,19 @@ class FortCore(Plugin):
         kit = kits[kit_index]
         map_data = maps[kit_index]
         
-        if data.state == GameState.MATCH or data.state == GameState.TELEPORTING:
-            player.send_message(f"{ColorFormat.RED}You are already in a match!{ColorFormat.RESET}")
+        # Check state
+        if data.state != GameState.LOBBY:
+            player.send_message(f"{ColorFormat.RED}You must be in the lobby to join a match!{ColorFormat.RESET}")
             return
         
+        # Check capacity
         online_count = sum(1 for pd in self.player_data.values() 
                          if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
         if online_count >= kit.get("maxPlayers", 8):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
         
+        # Check cooldown
         current_time = datetime.now().timestamp()
         last_teleport = self.teleport_cooldown.get(kit.get("name"), 0)
         if current_time - last_teleport < 5.0:
@@ -275,6 +427,7 @@ class FortCore(Plugin):
         data.state = GameState.TELEPORTING
         self.teleport_cooldown[kit.get("name")] = current_time
         
+        # Teleport immediately (delay=1 tick)
         self.server.scheduler.run_task(
             self, lambda: self.teleport_to_match(player, kit, map_data), delay=1
         )
@@ -284,8 +437,10 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
+        # Clear inventory
         player.inventory.clear()
         
+        # Get spawn location
         spawn = map_data.get("spawn", {})
         world_name = map_data.get("world", "world")
         
@@ -300,14 +455,24 @@ class FortCore(Plugin):
                 level = None
         
         if level:
-            player.teleport(level, spawn.get("x", 0), spawn.get("y", 64), spawn.get("z", 0))
+            x = float(spawn.get("x", 0))
+            y = float(spawn.get("y", 64))
+            z = float(spawn.get("z", 0))
+            player.teleport(level, x, y, z)
+        else:
+            player.send_message(f"{ColorFormat.RED}Failed to teleport! World not found.{ColorFormat.RESET}")
+            data.state = GameState.LOBBY
+            return
         
+        # Set state and match info
         data.state = GameState.MATCH
         data.current_kit = kit.get("name")
         data.current_map = map_data.get("name")
         
+        # Initialize rollback
         self.init_rollback(player_uuid)
         
+        # Send messages
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.AQUA}{map_data.get('name')} {ColorFormat.GRAY}-- By: {map_data.get('creator')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.YELLOW}{kit.get('name')} {ColorFormat.GRAY}-- By: {kit.get('creator')}{ColorFormat.RESET}")
@@ -316,8 +481,11 @@ class FortCore(Plugin):
         """Initialize rollback system"""
         data = self.get_player_data(player_uuid)
         
+        # Clear any existing data
         data.rollback_buffer.clear()
+        data.pending_rollback_actions.clear()
         
+        # Create CSV file
         csv_path = self.rollback_dir / f"rollback_{player_uuid}.csv"
         data.csv_path = csv_path
         
@@ -408,12 +576,24 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        if data.state == GameState.MATCH:
-            level = player.location.level
-            level.strike_lightning(player.location)
+        # Only process if in match
+        if data.state != GameState.MATCH:
+            return
         
+        # Strike lightning at death location
+        try:
+            dimension = player.location.dimension
+            dimension.strike_lightning(player.location)
+        except Exception as e:
+            self.logger.error(f"Failed to strike lightning: {e}")
+        
+        # Clear inventory immediately
         player.inventory.clear()
-        self.start_rollback(player_uuid)
+        
+        # Start rollback process
+        self.server.scheduler.run_task(
+            self, lambda: self.start_rollback(player_uuid), delay=5
+        )
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
@@ -422,6 +602,7 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
+        # If in match, flush and rollback
         if data.state == GameState.MATCH:
             self.flush_buffer(player_uuid)
             self.start_rollback(player_uuid)
@@ -452,12 +633,17 @@ class FortCore(Plugin):
         """Start the rollback process"""
         data = self.get_player_data(player_uuid)
         
+        # Prevent double rollback
         if data.state == GameState.ROLLBACK:
             return
         
-        self.flush_buffer(player_uuid)
+        # Set state immediately
         data.state = GameState.ROLLBACK
         
+        # Flush buffer
+        self.flush_buffer(player_uuid)
+        
+        # Read CSV and start processing
         if data.csv_path and data.csv_path.exists():
             actions = self.read_rollback_csv(data.csv_path)
             if actions:
@@ -470,8 +656,10 @@ class FortCore(Plugin):
                 )
                 self.rollback_tasks[player_uuid] = task_id
             else:
+                # No actions to rollback, finish immediately
                 self.finish_rollback(player_uuid)
         else:
+            # No CSV file, finish immediately
             self.finish_rollback(player_uuid)
     
     def read_rollback_csv(self, csv_path: Path) -> List[Dict]:
@@ -495,6 +683,7 @@ class FortCore(Plugin):
             self.finish_rollback(player_uuid)
             return
         
+        # Process up to 2 actions
         for _ in range(min(2, len(actions))):
             if not actions:
                 break
@@ -502,6 +691,7 @@ class FortCore(Plugin):
             action = actions.pop(0)
             self.revert_action(action)
         
+        # If no more actions, finish
         if not actions:
             self.finish_rollback(player_uuid)
     
@@ -514,7 +704,12 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            world_name = self.plugin_config.get("lobby_spawn", {}).get("world", "world")
+            # Get world from first map config
+            maps = self.plugin_config.get("maps", [])
+            if maps:
+                world_name = maps[0].get("world", "world")
+            else:
+                world_name = "world"
             
             try:
                 level = self.server.get_world(world_name)
@@ -543,24 +738,37 @@ class FortCore(Plugin):
         """Finish rollback and reset player"""
         data = self.get_player_data(player_uuid)
         
+        # Cancel and remove task
         if player_uuid in self.rollback_tasks:
-            self.server.scheduler.cancel_task(self.rollback_tasks[player_uuid])
-            del self.rollback_tasks[player_uuid]
+            try:
+                task_id = self.rollback_tasks[player_uuid]
+                self.server.scheduler.cancel_task(task_id)
+            except Exception as e:
+                self.logger.error(f"Error canceling task: {e}")
+            finally:
+                del self.rollback_tasks[player_uuid]
         
+        # Delete CSV file
         if data.csv_path and data.csv_path.exists():
             try:
                 data.csv_path.unlink()
             except Exception as e:
                 self.logger.error(f"Error deleting CSV: {e}")
         
+        # Clear data
         data.rollback_buffer.clear()
         data.pending_rollback_actions.clear()
         data.csv_path = None
         data.current_kit = None
         data.current_map = None
         
-        player = self.server.get_player(uuid.UUID(player_uuid))
+        # Get player object
+        player = self.server.get_player(uuid_module.UUID(player_uuid))
+        
+        # Reset player if online
         if player:
             self.reset_player(player)
-        
-        data.state = GameState.LOBBY
+            player.send_message(f"{ColorFormat.GREEN}Rollback complete! You're back in the lobby.{ColorFormat.RESET}")
+        else:
+            # Player offline, just set state
+            data.state = GameState.LOBBY
