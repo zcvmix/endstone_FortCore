@@ -51,7 +51,7 @@ class FortCore(Plugin):
     def __init__(self):
         super().__init__()
         self.player_data: Dict[str, PlayerData] = {}
-        self.plugin_config: Dict = {}  # Changed from self.config
+        self.plugin_config: Dict = {}
         self.teleport_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
@@ -59,7 +59,7 @@ class FortCore(Plugin):
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
-        self.load_plugin_config()  # Changed method name
+        self.load_plugin_config()
         
     def on_enable(self) -> None:
         self.logger.info("FortCore enabled!")
@@ -90,22 +90,20 @@ class FortCore(Plugin):
     def register_command(self) -> None:
         """Register the /out command with permission for all players"""
         try:
-            # Get the command
             command = self.get_command("out")
             if command:
                 command.executor = self
                 
-                # Create permission for the command (accessible to everyone)
                 perm = self.server.plugin_manager.add_permission("fortcore.command.out")
                 if perm:
                     perm.description = "Allow players to leave matches"
-                    perm.default = True  # Make it available to all players
+                    perm.default = True
                 
                 self.logger.info("Registered /out command")
         except Exception as e:
             self.logger.error(f"Failed to register command: {e}")
         
-    def load_plugin_config(self) -> None:  # Renamed from load_config
+    def load_plugin_config(self) -> None:
         """Load configuration from config.yml"""
         config_path = Path(self.data_folder) / "config.yml"
         
@@ -137,10 +135,10 @@ class FortCore(Plugin):
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
                 yaml.dump(default_config, f, default_flow_style=False)
-            self.plugin_config = default_config  # Changed
+            self.plugin_config = default_config
         else:
             with open(config_path, 'r') as f:
-                self.plugin_config = yaml.safe_load(f)  # Changed
+                self.plugin_config = yaml.safe_load(f)
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -151,29 +149,23 @@ class FortCore(Plugin):
     def reset_player(self, player) -> None:
         """Complete player reset"""
         try:
-            # Gamemode survival
             player.game_mode = GameMode.SURVIVAL
             
-            # Clear all effects using command (active_effects property doesn't exist in 0.10.18)
             try:
                 self.server.dispatch_command(self.server.command_sender, f'effect "{player.name}" clear')
             except:
                 pass
             
-            # Clear inventory (main, armor, offhand)
             inventory = player.inventory
             inventory.clear()
             
-            # Teleport to lobby
             lobby = self.plugin_config.get("lobby_spawn", {})
             world_name = lobby.get("world", "world")
             
-            # Get world - try different methods
             try:
                 level = self.server.get_world(world_name)
             except:
                 try:
-                    # Fallback to worlds list
                     level = next((w for w in self.server.worlds if w.name == world_name), None)
                     if not level:
                         level = self.server.worlds[0] if self.server.worlds else None
@@ -183,12 +175,10 @@ class FortCore(Plugin):
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
             
-            # Give menu item (lodestone compass) in slot 9
             from endstone.inventory import ItemStack
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
             inventory.set_item(8, menu_item)
             
-            # Apply weakness 255 infinite no particles using command
             try:
                 self.server.dispatch_command(
                     self.server.command_sender,
@@ -213,13 +203,9 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        # Reset player
         self.reset_player(player)
-        
-        # Set state to LOBBY
         data.state = GameState.LOBBY
         
-        # Welcome message
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to join a match!{ColorFormat.RESET}")
     
@@ -238,8 +224,6 @@ class FortCore(Plugin):
         form.title = "FortCore"
         
         kits = self.plugin_config.get("kits", [])
-        
-        # Store callbacks in a list to avoid lambda capture issues
         callbacks = []
         
         for i, kit in enumerate(kits):
@@ -249,22 +233,21 @@ class FortCore(Plugin):
             
             button_text = f"{kit.get('name', 'Unknown')} [{online_count}/{max_players}]"
             
-            # Create callback that captures index properly
             def make_callback(idx):
                 return lambda p: self.handle_kit_select(p, idx)
             
             callbacks.append(make_callback(i))
             form.add_button(button_text, on_click=callbacks[-1])
         
-        form.send(player)
+        player.send_form(form)
     
     def handle_kit_select(self, player, kit_index: int) -> None:
         """Handle kit selection"""
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        kits = self.plugin_config.get("kits", [])  # Changed
-        maps = self.plugin_config.get("maps", [])  # Changed
+        kits = self.plugin_config.get("kits", [])
+        maps = self.plugin_config.get("maps", [])
         
         if kit_index >= len(kits) or kit_index >= len(maps):
             player.send_message(f"{ColorFormat.RED}Invalid selection!{ColorFormat.RESET}")
@@ -273,30 +256,25 @@ class FortCore(Plugin):
         kit = kits[kit_index]
         map_data = maps[kit_index]
         
-        # Check if already in match
         if data.state == GameState.MATCH or data.state == GameState.TELEPORTING:
             player.send_message(f"{ColorFormat.RED}You are already in a match!{ColorFormat.RESET}")
             return
         
-        # Check if kit is full
         online_count = sum(1 for pd in self.player_data.values() 
                          if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
         if online_count >= kit.get("maxPlayers", 8):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
         
-        # Check global cooldown (5 seconds)
         current_time = datetime.now().timestamp()
         last_teleport = self.teleport_cooldown.get(kit.get("name"), 0)
         if current_time - last_teleport < 5.0:
             player.send_message(f"{ColorFormat.RED}Someone just teleported! Wait a moment...{ColorFormat.RESET}")
             return
         
-        # Set teleporting state
         data.state = GameState.TELEPORTING
         self.teleport_cooldown[kit.get("name")] = current_time
         
-        # Schedule teleport
         self.server.scheduler.run_task(
             self, lambda: self.teleport_to_match(player, kit, map_data), delay=1
         )
@@ -306,14 +284,11 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        # Clear inventory
         player.inventory.clear()
         
-        # Teleport to map spawn
         spawn = map_data.get("spawn", {})
         world_name = map_data.get("world", "world")
         
-        # Get world
         try:
             level = self.server.get_world(world_name)
         except:
@@ -327,15 +302,12 @@ class FortCore(Plugin):
         if level:
             player.teleport(level, spawn.get("x", 0), spawn.get("y", 64), spawn.get("z", 0))
         
-        # Set state to MATCH
         data.state = GameState.MATCH
         data.current_kit = kit.get("name")
         data.current_map = map_data.get("name")
         
-        # Initialize rollback
         self.init_rollback(player_uuid)
         
-        # Show match info
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.AQUA}{map_data.get('name')} {ColorFormat.GRAY}-- By: {map_data.get('creator')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.YELLOW}{kit.get('name')} {ColorFormat.GRAY}-- By: {kit.get('creator')}{ColorFormat.RESET}")
@@ -437,14 +409,10 @@ class FortCore(Plugin):
         data = self.get_player_data(player_uuid)
         
         if data.state == GameState.MATCH:
-            # Strike lightning at death location
             level = player.location.level
             level.strike_lightning(player.location)
         
-        # Clear inventory
         player.inventory.clear()
-        
-        # Start rollback
         self.start_rollback(player_uuid)
     
     @event_handler
@@ -493,7 +461,6 @@ class FortCore(Plugin):
         if data.csv_path and data.csv_path.exists():
             actions = self.read_rollback_csv(data.csv_path)
             if actions:
-                # Store actions in player data so the task can access them
                 data.pending_rollback_actions = actions
                 task_id = self.server.scheduler.run_task(
                     self, 
@@ -549,7 +516,6 @@ class FortCore(Plugin):
             
             world_name = self.plugin_config.get("lobby_spawn", {}).get("world", "world")
             
-            # Get world
             try:
                 level = self.server.get_world(world_name)
             except:
@@ -593,7 +559,6 @@ class FortCore(Plugin):
         data.current_kit = None
         data.current_map = None
         
-        # Use standard uuid.UUID instead of uuid_lib.UUID
         player = self.server.get_player(uuid.UUID(player_uuid))
         if player:
             self.reset_player(player)
