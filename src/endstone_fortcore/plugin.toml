@@ -1,0 +1,14 @@
+name = "fortcore"
+version = "1.1.0"
+main = "endstone_fortcore:FortCore"
+description = "High-performance PvP Core plugin for Endstone Bedrock servers"
+authors = ["Admin"]
+api-version = "0.5"
+
+[commands.out]
+description = "Leave the current match and return to lobby"
+usages = ["/out"]
+permissions = ["fortcore.command.out"]
+
+[permissions]
+"fortcore.command.out" = { description = "Allow players to leave matches", default = true }
