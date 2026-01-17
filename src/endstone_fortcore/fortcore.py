@@ -154,9 +154,11 @@ class FortCore(Plugin):
             # Gamemode survival
             player.game_mode = GameMode.SURVIVAL
             
-            # Clear all effects
-            for effect in player.active_effects:
-                player.remove_effect(effect.type)
+            # Clear all effects using command (active_effects property doesn't exist in 0.10.18)
+            try:
+                self.server.dispatch_command(self.server.command_sender, f'effect "{player.name}" clear')
+            except:
+                pass
             
             # Clear inventory (main, armor, offhand)
             inventory = player.inventory
@@ -173,10 +175,14 @@ class FortCore(Plugin):
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
             inventory.set_item(8, menu_item)
             
-            # Apply weakness 255 infinite no particles
-            from endstone.potion import PotionEffect, PotionEffectType
-            weakness = PotionEffect(PotionEffectType.WEAKNESS, -1, 255, False, False, False)
-            player.add_effect(weakness)
+            # Apply weakness 255 infinite no particles using command
+            try:
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f'effect "{player.name}" weakness 999999 255 true'
+                )
+            except:
+                pass
             
         except Exception as e:
             self.logger.error(f"Error resetting player: {e}")
@@ -215,18 +221,27 @@ class FortCore(Plugin):
     
     def open_kit_menu(self, player) -> None:
         """Open the kit selection menu"""
+        from endstone.form import Button
+        
         form = ActionForm()
         form.title = "FortCore"
         
         kits = self.plugin_config.get("kits", [])  # Changed
         
+        buttons = []
         for i, kit in enumerate(kits):
             online_count = sum(1 for pd in self.player_data.values() 
                              if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
             max_players = kit.get("maxPlayers", 8)
             
             button_text = f"{kit.get('name', 'Unknown')} [{online_count}/{max_players}]"
-            form.button(button_text, on_click=lambda p, idx=i: self.handle_kit_select(p, idx))
+            # Create button with on_click callback that captures the index
+            button = Button(button_text, on_click=lambda p, idx=i: self.handle_kit_select(p, idx))
+            buttons.append(button)
+        
+        # Add all buttons to form
+        for button in buttons:
+            form.add_button(button)
         
         form.send(player)
     
