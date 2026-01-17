@@ -55,7 +55,7 @@ class FortCore(Plugin):
         self.teleport_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
-        self.rollback_tasks: Dict[str, int] = {}  # Stores task IDs (int), not Task objects
+        self.rollback_tasks: Dict[str, int] = {}  # Stores task IDs (int)
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
@@ -88,7 +88,10 @@ class FortCore(Plugin):
         self.logger.info("FortCore disabling...")
         self.flush_all_buffers()
         if self.flush_task:
-            self.server.scheduler.cancel_task(self.flush_task)
+            try:
+                self.server.scheduler.cancel_task(self.flush_task)
+            except:
+                pass
         for task_id in list(self.rollback_tasks.values()):
             try:
                 self.server.scheduler.cancel_task(task_id)
@@ -218,23 +221,21 @@ class FortCore(Plugin):
         return self.player_data[player_uuid]
     
     def reset_player(self, player) -> None:
-        """Complete player reset - ALWAYS brings player back to lobby state"""
+        """Complete player reset - Called ONLY when returning to lobby"""
         try:
             player_uuid = str(player.unique_id)
             data = self.get_player_data(player_uuid)
             
-            # Do NOT cancel rollback tasks - let them complete naturally
-            # Only clean up if rollback is fully done
+            # Clean up rollback data only if not actively rolling back
             if data.state != GameState.ROLLBACK:
                 if player_uuid in self.rollback_tasks:
                     try:
-                        self.server.scheduler.cancel_task(self.rollback_tasks[player_uuid])
+                        task_id = self.rollback_tasks[player_uuid]
+                        self.server.scheduler.cancel_task(task_id)
                         del self.rollback_tasks[player_uuid]
                     except:
                         pass
-            
-            # Clean up rollback data only if not actively rolling back
-            if data.state != GameState.ROLLBACK:
+                
                 if data.csv_path and data.csv_path.exists():
                     try:
                         data.csv_path.unlink()
@@ -247,24 +248,25 @@ class FortCore(Plugin):
                 data.current_kit = None
                 data.current_map = None
             
+            # Set state to LOBBY
             data.state = GameState.LOBBY
             
             # Reset game mode
             player.game_mode = GameMode.SURVIVAL
             
-            # Clear effects
+            # Clear all effects using command
             try:
                 self.server.dispatch_command(self.server.command_sender, f'effect "{player.name}" clear')
-            except:
-                pass
+            except Exception as e:
+                self.logger.error(f"Failed to clear effects: {e}")
             
             # Clear inventory completely
             inventory = player.inventory
             inventory.clear()
             
-            # Get armor inventory and clear it
+            # Clear armor
             try:
-                for i in range(4):  # Helmet, chestplate, leggings, boots
+                for i in range(4):
                     inventory.set_armor_contents(i, None)
             except:
                 pass
@@ -275,19 +277,22 @@ class FortCore(Plugin):
             except:
                 pass
             
-            # Teleport to lobby
+            # Teleport to lobby - use player's current dimension as fallback
             lobby = self.plugin_config.get("lobby_spawn", {})
             world_name = lobby.get("world", "world")
             
             try:
                 level = self.server.get_world(world_name)
             except:
+                # Fallback to player's current dimension
                 try:
-                    level = next((w for w in self.server.worlds if w.name == world_name), None)
-                    if not level:
-                        level = self.server.worlds[0] if self.server.worlds else None
+                    level = player.location.dimension
                 except:
-                    level = None
+                    # Last resort: first world
+                    try:
+                        level = self.server.worlds[0] if self.server.worlds else None
+                    except:
+                        level = None
             
             if level:
                 player.teleport(level, lobby.get("x", 0), lobby.get("y", 100), lobby.get("z", 0))
@@ -297,31 +302,43 @@ class FortCore(Plugin):
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
             inventory.set_item(8, menu_item)
             
-            # Apply weakness effect
+            # Apply effects using commands (more reliable than API)
             try:
+                # Weakness 255 infinite
                 self.server.dispatch_command(
                     self.server.command_sender,
                     f'effect "{player.name}" weakness 999999 255 true'
                 )
-            except:
-                pass
+                # Resistance 255 for 5 seconds
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f'effect "{player.name}" resistance 5 255 true'
+                )
+                # Blindness 255 for 5 seconds
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f'effect "{player.name}" blindness 5 255 true'
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to apply effects: {e}")
             
         except Exception as e:
             self.logger.error(f"Error resetting player: {e}")
     
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent) -> None:
-        """Handle player join - always reset to ensure clean state"""
+        """Handle player join - RESET ONCE per session"""
         player = event.player
         player_uuid = str(player.unique_id)
         
-        # Check if player has an ongoing rollback
+        # Get/create data
         data = self.get_player_data(player_uuid)
+        
+        # Check if player has an ongoing rollback
         if data.state == GameState.ROLLBACK:
-            # Don't interrupt rollback, just notify
             self.logger.info(f"Player {player.name} joined during rollback - will reset when complete")
         else:
-            # No rollback, safe to clean up
+            # No rollback, safe to clean up old CSV
             csv_path = self.rollback_dir / f"rollback_{player_uuid}.csv"
             if csv_path.exists():
                 try:
@@ -329,7 +346,7 @@ class FortCore(Plugin):
                 except:
                     pass
         
-        # Schedule reset with delay
+        # Schedule reset with delay (only runs if not in rollback)
         self.server.scheduler.run_task(
             self, lambda: self.handle_join_sequence(player), delay=10
         )
@@ -417,13 +434,14 @@ class FortCore(Plugin):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
         
-        # Check cooldown
+        # Check cooldown (5 seconds global cooldown per kit)
         current_time = datetime.now().timestamp()
         last_teleport = self.teleport_cooldown.get(kit.get("name"), 0)
         if current_time - last_teleport < 5.0:
             player.send_message(f"{ColorFormat.RED}Someone just teleported! Wait a moment...{ColorFormat.RESET}")
             return
         
+        # Set state and cooldown
         data.state = GameState.TELEPORTING
         self.teleport_cooldown[kit.get("name")] = current_time
         
@@ -444,15 +462,18 @@ class FortCore(Plugin):
         spawn = map_data.get("spawn", {})
         world_name = map_data.get("world", "world")
         
+        # Try to get the configured world, fallback to player's current dimension
         try:
             level = self.server.get_world(world_name)
         except:
             try:
-                level = next((w for w in self.server.worlds if w.name == world_name), None)
-                if not level:
-                    level = self.server.worlds[0] if self.server.worlds else None
+                level = player.location.dimension
+                self.logger.warning(f"World '{world_name}' not found, using player's current dimension")
             except:
-                level = None
+                try:
+                    level = self.server.worlds[0] if self.server.worlds else None
+                except:
+                    level = None
         
         if level:
             x = float(spawn.get("x", 0))
@@ -460,7 +481,7 @@ class FortCore(Plugin):
             z = float(spawn.get("z", 0))
             player.teleport(level, x, y, z)
         else:
-            player.send_message(f"{ColorFormat.RED}Failed to teleport! World not found.{ColorFormat.RESET}")
+            player.send_message(f"{ColorFormat.RED}Failed to teleport! No valid world found.{ColorFormat.RESET}")
             data.state = GameState.LOBBY
             return
         
@@ -571,16 +592,21 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent) -> None:
-        """Handle player death"""
+        """Handle player death - Trigger rollback, reset happens AFTER rollback completes"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
         # Only process if in match
         if data.state != GameState.MATCH:
+            # Not in match - just clear inventory and teleport (no thunder)
+            player.inventory.clear()
+            self.server.scheduler.run_task(
+                self, lambda: self.reset_player(player), delay=5
+            )
             return
         
-        # Strike lightning at death location
+        # In match - strike lightning at death location
         try:
             dimension = player.location.dimension
             dimension.strike_lightning(player.location)
@@ -590,7 +616,7 @@ class FortCore(Plugin):
         # Clear inventory immediately
         player.inventory.clear()
         
-        # Start rollback process
+        # Start rollback process (reset happens in finish_rollback)
         self.server.scheduler.run_task(
             self, lambda: self.start_rollback(player_uuid), delay=5
         )
@@ -735,8 +761,12 @@ class FortCore(Plugin):
             self.logger.error(f"Error reverting action: {e}")
     
     def finish_rollback(self, player_uuid: str) -> None:
-        """Finish rollback and reset player"""
+        """Finish rollback and reset player - Called ONCE per rollback cycle"""
         data = self.get_player_data(player_uuid)
+        
+        # Prevent running finish_rollback multiple times
+        if data.state != GameState.ROLLBACK:
+            return
         
         # Cancel and remove task
         if player_uuid in self.rollback_tasks:
@@ -763,7 +793,10 @@ class FortCore(Plugin):
         data.current_map = None
         
         # Get player object
-        player = self.server.get_player(uuid_module.UUID(player_uuid))
+        try:
+            player = self.server.get_player(uuid_module.UUID(player_uuid))
+        except:
+            player = None
         
         # Reset player if online
         if player:
@@ -772,3 +805,4 @@ class FortCore(Plugin):
         else:
             # Player offline, just set state
             data.state = GameState.LOBBY
+            data.has_been_reset = False
