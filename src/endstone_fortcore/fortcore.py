@@ -3,9 +3,10 @@
 
 from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent
-from endstone import ColorFormat, GameMode
+from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent, PlayerRespawnEvent, PlayerDropItemEvent
+from endstone import ColorFormat, GameMode, Location
 from endstone.form import ActionForm
+from endstone.inventory import ItemStack
 import yaml
 import csv
 from pathlib import Path
@@ -53,6 +54,7 @@ class FortCore(Plugin):
         self.player_data: Dict[str, PlayerData] = {}
         self.plugin_config: Dict = {}
         self.teleport_cooldown: Dict[str, float] = {}
+        self.form_cooldown: Dict[str, float] = {}
         self.rollback_dir: Path = None
         self.flush_task = None
         self.rollback_tasks: Dict[str, int] = {}
@@ -64,7 +66,6 @@ class FortCore(Plugin):
     def on_enable(self) -> None:
         self.logger.info("FortCore enabled!")
         self.register_events(self)
-        self.register_command()
         
         self.rollback_dir = Path(self.data_folder) / "rollbacks"
         self.rollback_dir.mkdir(parents=True, exist_ok=True)
@@ -141,20 +142,6 @@ class FortCore(Plugin):
                         
         except Exception as e:
             self.logger.error(f"Error during rollback resume: {e}")
-    
-    def register_command(self) -> None:
-        """Register the /out command"""
-        try:
-            command = self.get_command("out")
-            if command:
-                command.executor = self
-                perm = self.server.plugin_manager.add_permission("fortcore.command.out")
-                if perm:
-                    perm.description = "Allow players to leave matches"
-                    perm.default = True
-                self.logger.info("Registered /out command")
-        except Exception as e:
-            self.logger.error(f"Failed to register command: {e}")
         
     def load_plugin_config(self) -> None:
         """Load configuration from config.yml"""
@@ -162,9 +149,27 @@ class FortCore(Plugin):
         
         if not config_path.exists():
             default_config = {
-                "lobby_spawn": {"x": 0, "y": 100, "z": 0, "world": "world"},
-                "maps": [{"name": "Diamond Arena", "creator": "Admin", "spawn": {"x": 100, "y": 64, "z": 100}, "world": "world"}],
-                "kits": [{"name": "Diamond SMP", "creator": "Admin", "maxPlayers": 8}]
+                "lobby_spawn": {
+                    "x": 0.5,
+                    "y": 100.0,
+                    "z": 0.5
+                },
+                "maps": [
+                    {
+                        "name": "Diamond Arena",
+                        "creator": "Admin",
+                        "spawn_x": 100.5,
+                        "spawn_y": 64.0,
+                        "spawn_z": 100.5
+                    }
+                ],
+                "kits": [
+                    {
+                        "name": "Diamond SMP",
+                        "creator": "Admin",
+                        "max_players": 8
+                    }
+                ]
             }
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
@@ -230,20 +235,25 @@ class FortCore(Plugin):
                 pass
             
             lobby = self.plugin_config.get("lobby_spawn", {})
-            
-            # Always use player's current dimension
             dimension = player.location.dimension
-            x = float(lobby.get("x", 0))
-            y = float(lobby.get("y", 100))
-            z = float(lobby.get("z", 0))
+            x = float(lobby.get("x", 0.5))
+            y = float(lobby.get("y", 100.0))
+            z = float(lobby.get("z", 0.5))
             
-            from endstone import Location
             new_location = Location(dimension, x, y, z)
             player.teleport(new_location)
             
-            from endstone.inventory import ItemStack
-            menu_item = ItemStack("minecraft:lodestone_compass", 1)
-            inventory.set_item(8, menu_item)
+            # Give locked compass using Bedrock command with NBT
+            try:
+                self.server.dispatch_command(
+                    self.server.command_sender,
+                    f'give "{player.name}" lodestone_compass 1 0 {{"minecraft:item_lock":{{"mode":"lock_in_inventory"}}}}'
+                )
+            except Exception as e:
+                self.logger.error(f"Failed to give locked compass: {e}")
+                # Fallback to regular compass
+                menu_item = ItemStack("minecraft:lodestone_compass", 1)
+                inventory.set_item(8, menu_item)
             
             try:
                 self.server.dispatch_command(self.server.command_sender, f'effect "{player.name}" weakness 999999 255 true')
@@ -287,8 +297,46 @@ class FortCore(Plugin):
             player.send_message(f"{ColorFormat.YELLOW}Your previous session is being cleaned up...{ColorFormat.RESET}")
     
     @event_handler
+    def on_player_respawn(self, event: PlayerRespawnEvent) -> None:
+        """Handle player respawn - teleport to lobby and give compass"""
+        player = event.player
+        
+        self.server.scheduler.run_task(self, lambda: self.handle_respawn(player), delay=5)
+    
+    def handle_respawn(self, player) -> None:
+        """Handle respawn sequence"""
+        lobby = self.plugin_config.get("lobby_spawn", {})
+        dimension = player.location.dimension
+        x = float(lobby.get("x", 0.5))
+        y = float(lobby.get("y", 100.0))
+        z = float(lobby.get("z", 0.5))
+        
+        new_location = Location(dimension, x, y, z)
+        player.teleport(new_location)
+        
+        # Give locked compass using Bedrock command with NBT
+        try:
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f'give "{player.name}" lodestone_compass 1 0 {{"minecraft:item_lock":{{"mode":"lock_in_inventory"}}}}'
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to give locked compass: {e}")
+            # Fallback to regular compass
+            menu_item = ItemStack("minecraft:lodestone_compass", 1)
+            player.inventory.set_item(8, menu_item)
+    
+    @event_handler
+    def on_player_drop_item(self, event: PlayerDropItemEvent) -> None:
+        """Prevent dropping any locked items"""
+        item = event.item_drop.item_stack
+        if item and item.type == "minecraft:lodestone_compass":
+            event.cancelled = True
+            event.player.send_message(f"{ColorFormat.RED}You cannot drop this item!{ColorFormat.RESET}")
+    
+    @event_handler
     def on_player_interact(self, event: PlayerInteractEvent) -> None:
-        """Handle compass click"""
+        """Handle compass click with cooldown"""
         player = event.player
         item = player.inventory.item_in_main_hand
         
@@ -303,6 +351,15 @@ class FortCore(Plugin):
                     player.send_message(f"{ColorFormat.RED}You must be in the lobby!{ColorFormat.RESET}")
                 return
             
+            current_time = datetime.now().timestamp()
+            last_open = self.form_cooldown.get(player_uuid, 0)
+            remaining = 1.0 - (current_time - last_open)
+            
+            if remaining > 0:
+                player.send_message(f"{ColorFormat.RED}Please wait {remaining:.1f}s{ColorFormat.RESET}")
+                return
+            
+            self.form_cooldown[player_uuid] = current_time
             self.open_kit_menu(player)
     
     def open_kit_menu(self, player) -> None:
@@ -316,7 +373,7 @@ class FortCore(Plugin):
         for i, kit in enumerate(kits):
             online_count = sum(1 for pd in self.player_data.values() 
                              if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
-            max_players = kit.get("maxPlayers", 8)
+            max_players = kit.get("max_players", 8)
             button_text = f"{kit.get('name', 'Unknown')} [{online_count}/{max_players}]"
             
             def make_callback(idx):
@@ -348,7 +405,7 @@ class FortCore(Plugin):
         
         online_count = sum(1 for pd in self.player_data.values() 
                          if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
-        if online_count >= kit.get("maxPlayers", 8):
+        if online_count >= kit.get("max_players", 8):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
         
@@ -370,15 +427,11 @@ class FortCore(Plugin):
         
         player.inventory.clear()
         
-        spawn = map_data.get("spawn", {})
-        
-        # Always use player's current dimension
         dimension = player.location.dimension
-        x = float(spawn.get("x", 0))
-        y = float(spawn.get("y", 64))
-        z = float(spawn.get("z", 0))
+        x = float(map_data.get("spawn_x", 0.5))
+        y = float(map_data.get("spawn_y", 64.0))
+        z = float(map_data.get("spawn_z", 0.5))
         
-        from endstone import Location
         new_location = Location(dimension, x, y, z)
         player.teleport(new_location)
         
@@ -468,7 +521,6 @@ class FortCore(Plugin):
         
         if data.state != GameState.MATCH:
             player.inventory.clear()
-            self.server.scheduler.run_task(self, lambda: self.reset_player(player), delay=5)
             return
         
         try:
@@ -494,20 +546,20 @@ class FortCore(Plugin):
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         """Handle /out command"""
         if command.name == "out":
-            if not hasattr(sender, 'unique_id'):
-                sender.send_message(f"{ColorFormat.RED}Only players can use this!{ColorFormat.RESET}")
+            if not hasattr(sender, "unique_id"):
+                sender.send_message("Only players can use this.")
                 return True
             
             player_uuid = str(sender.unique_id)
             data = self.get_player_data(player_uuid)
             
             if data.state != GameState.MATCH:
-                sender.send_message(f"{ColorFormat.RED}You are not in a match!{ColorFormat.RESET}")
+                sender.send_message("You are not in a match!")
                 return True
             
             self.flush_buffer(player_uuid)
             self.start_rollback(player_uuid)
-            sender.send_message(f"{ColorFormat.YELLOW}Leaving match...{ColorFormat.RESET}")
+            sender.send_message("Leaving match...")
             return True
         
         return False
@@ -572,18 +624,10 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            maps = self.plugin_config.get("maps", [])
-            world_name = maps[0].get("world", "world") if maps else "world"
-            
             try:
-                level = self.server.get_world(world_name)
+                level = self.server.worlds[0] if self.server.worlds else None
             except:
-                try:
-                    level = next((w for w in self.server.worlds if w.name == world_name), None)
-                    if not level:
-                        level = self.server.worlds[0] if self.server.worlds else None
-                except:
-                    level = None
+                level = None
             
             if not level:
                 return
