@@ -5,10 +5,10 @@ from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
 from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent, PlayerRespawnEvent, PlayerDropItemEvent
 from endstone import ColorFormat, GameMode
-from endstone.level import Location  # FIXED: Location is in endstone.level module
+from endstone.level import Location
 from endstone.form import ActionForm
 from endstone.inventory import ItemStack
-import yaml
+import json
 import csv
 from pathlib import Path
 from datetime import datetime
@@ -43,8 +43,8 @@ class PlayerData:
         self.rollback_buffer: List[RollbackAction] = []
         self.csv_path: Optional[Path] = None
         self.last_flush = datetime.now().timestamp()
-        self.current_map: Optional[str] = None
-        self.current_kit: Optional[str] = None
+        self.current_category: Optional[str] = None
+        self.current_match: Optional[str] = None
         self.pending_rollback_actions: List[Dict] = []
 
 class FortCore(Plugin):
@@ -74,7 +74,8 @@ class FortCore(Plugin):
         self.server.scheduler.run_task(self, self.resume_incomplete_rollbacks, delay=40)
         self.flush_task = self.server.scheduler.run_task(self, self.flush_all_buffers, delay=1200, period=1200)
         
-        self.logger.info(f"Loaded {len(self.plugin_config.get('maps', []))} maps and {len(self.plugin_config.get('kits', []))} kits")
+        total_matches = sum(len(matches) for matches in self.plugin_config.get("categories", {}).values())
+        self.logger.info(f"Loaded {len(self.plugin_config.get('categories', {}))} categories with {total_matches} total matches")
         
     def on_disable(self) -> None:
         self.logger.info("FortCore disabling...")
@@ -145,40 +146,50 @@ class FortCore(Plugin):
             self.logger.error(f"Error during rollback resume: {e}")
         
     def load_plugin_config(self) -> None:
-        """Load configuration from config.yml"""
-        config_path = Path(self.data_folder) / "config.yml"
+        """Load configuration from config.json"""
+        config_path = Path(self.data_folder) / "config.json"
         
         if not config_path.exists():
             default_config = {
-                "lobby_spawn": {
-                    "x": 0.5,
-                    "y": 100.0,
-                    "z": 0.5
-                },
-                "maps": [
-                    {
-                        "name": "Diamond Arena",
-                        "creator": "Admin",
-                        "spawn_x": 100.5,
-                        "spawn_y": 64.0,
-                        "spawn_z": 100.5
+                "lobby_spawn": [0.5, 100.0, 0.5],
+                "categories": {
+                    "SMP": {
+                        "DiamondSMP": {
+                            "map": "Diamond Arena",
+                            "kit": "Diamond Kit",
+                            "max_players": 8,
+                            "spawn": [100.5, 64.0, 100.5]
+                        },
+                        "NetheriteSMP": {
+                            "map": "Netherite Arena",
+                            "kit": "Netherite Kit",
+                            "max_players": 8,
+                            "spawn": [200.5, 64.0, 200.5]
+                        }
+                    },
+                    "PvP": {
+                        "Knight1v1": {
+                            "map": "Knight Arena",
+                            "kit": "Knight Kit",
+                            "max_players": 2,
+                            "spawn": [300.5, 64.0, 300.5]
+                        },
+                        "Archer1v1": {
+                            "map": "Archer Arena",
+                            "kit": "Archer Kit",
+                            "max_players": 2,
+                            "spawn": [400.5, 64.0, 400.5]
+                        }
                     }
-                ],
-                "kits": [
-                    {
-                        "name": "Diamond SMP",
-                        "creator": "Admin",
-                        "max_players": 8
-                    }
-                ]
+                }
             }
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
-                yaml.dump(default_config, f, default_flow_style=False)
+                json.dump(default_config, f, indent=2)
             self.plugin_config = default_config
         else:
             with open(config_path, 'r') as f:
-                self.plugin_config = yaml.safe_load(f)
+                self.plugin_config = json.load(f)
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -210,8 +221,8 @@ class FortCore(Plugin):
                 data.rollback_buffer.clear()
                 data.pending_rollback_actions.clear()
                 data.csv_path = None
-                data.current_kit = None
-                data.current_map = None
+                data.current_category = None
+                data.current_match = None
             
             data.state = GameState.LOBBY
             player.game_mode = GameMode.SURVIVAL
@@ -235,11 +246,9 @@ class FortCore(Plugin):
             except:
                 pass
             
-            lobby = self.plugin_config.get("lobby_spawn", {})
+            lobby = self.plugin_config.get("lobby_spawn", [0.5, 100.0, 0.5])
             dimension = player.location.dimension
-            x = float(lobby.get("x", 0.5))
-            y = float(lobby.get("y", 100.0))
-            z = float(lobby.get("z", 0.5))
+            x, y, z = float(lobby[0]), float(lobby[1]), float(lobby[2])
             
             new_location = Location(dimension, x, y, z)
             player.teleport(new_location)
@@ -293,7 +302,7 @@ class FortCore(Plugin):
         if data.state != GameState.ROLLBACK:
             self.reset_player(player)
             player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
-            player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to join a match!{ColorFormat.RESET}")
+            player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to select a match!{ColorFormat.RESET}")
         else:
             player.send_message(f"{ColorFormat.YELLOW}Your previous session is being cleaned up...{ColorFormat.RESET}")
     
@@ -306,11 +315,9 @@ class FortCore(Plugin):
     
     def handle_respawn(self, player) -> None:
         """Handle respawn sequence"""
-        lobby = self.plugin_config.get("lobby_spawn", {})
+        lobby = self.plugin_config.get("lobby_spawn", [0.5, 100.0, 0.5])
         dimension = player.location.dimension
-        x = float(lobby.get("x", 0.5))
-        y = float(lobby.get("y", 100.0))
-        z = float(lobby.get("z", 0.5))
+        x, y, z = float(lobby[0]), float(lobby[1]), float(lobby[2])
         
         new_location = Location(dimension, x, y, z)
         player.teleport(new_location)
@@ -361,67 +368,78 @@ class FortCore(Plugin):
                 return
             
             self.form_cooldown[player_uuid] = current_time
-            self.open_kit_menu(player)
+            self.open_category_menu(player)
     
-    def open_kit_menu(self, player) -> None:
-        """Open kit selection menu"""
+    def open_category_menu(self, player) -> None:
+        """Open category selection menu"""
         form = ActionForm()
-        form.title = "FortCore"
+        form.title = "FortCore - Select Category"
         
-        kits = self.plugin_config.get("kits", [])
-        callbacks = []
+        categories = self.plugin_config.get("categories", {})
         
-        for i, kit in enumerate(kits):
-            online_count = sum(1 for pd in self.player_data.values() 
-                             if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
-            max_players = kit.get("max_players", 8)
-            button_text = f"{kit.get('name', 'Unknown')} [{online_count}/{max_players}]"
+        for category_name in categories.keys():
+            def make_callback(cat):
+                return lambda p: self.open_match_menu(p, cat)
             
-            def make_callback(idx):
-                return lambda p: self.handle_kit_select(p, idx)
-            
-            callbacks.append(make_callback(i))
-            form.add_button(button_text, on_click=callbacks[-1])
+            form.add_button(category_name, on_click=make_callback(category_name))
         
         player.send_form(form)
     
-    def handle_kit_select(self, player, kit_index: int) -> None:
-        """Handle kit selection"""
+    def open_match_menu(self, player, category: str) -> None:
+        """Open match selection menu for a category"""
+        form = ActionForm()
+        form.title = f"FortCore - {category}"
+        
+        categories = self.plugin_config.get("categories", {})
+        matches = categories.get(category, {})
+        
+        for match_name, match_data in matches.items():
+            online_count = sum(1 for pd in self.player_data.values() 
+                             if pd.state == GameState.MATCH and pd.current_match == match_name)
+            max_players = match_data.get("max_players", 8)
+            button_text = f"{match_name} [{online_count}/{max_players}]"
+            
+            def make_callback(cat, match):
+                return lambda p: self.handle_match_select(p, cat, match)
+            
+            form.add_button(button_text, on_click=make_callback(category, match_name))
+        
+        player.send_form(form)
+    
+    def handle_match_select(self, player, category: str, match_name: str) -> None:
+        """Handle match selection"""
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        kits = self.plugin_config.get("kits", [])
-        maps = self.plugin_config.get("maps", [])
+        categories = self.plugin_config.get("categories", {})
+        match_data = categories.get(category, {}).get(match_name)
         
-        if kit_index >= len(kits) or kit_index >= len(maps):
-            player.send_message(f"{ColorFormat.RED}Invalid selection!{ColorFormat.RESET}")
+        if not match_data:
+            player.send_message(f"{ColorFormat.RED}Invalid match selection!{ColorFormat.RESET}")
             return
-        
-        kit = kits[kit_index]
-        map_data = maps[kit_index]
         
         if data.state != GameState.LOBBY:
             player.send_message(f"{ColorFormat.RED}You must be in the lobby!{ColorFormat.RESET}")
             return
         
         online_count = sum(1 for pd in self.player_data.values() 
-                         if pd.state == GameState.MATCH and pd.current_kit == kit.get("name"))
-        if online_count >= kit.get("max_players", 8):
+                         if pd.state == GameState.MATCH and pd.current_match == match_name)
+        if online_count >= match_data.get("max_players", 8):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
         
         current_time = datetime.now().timestamp()
-        last_teleport = self.teleport_cooldown.get(kit.get("name"), 0)
+        last_teleport = self.teleport_cooldown.get(match_name, 0)
         if current_time - last_teleport < 5.0:
             player.send_message(f"{ColorFormat.RED}Someone just teleported! Wait...{ColorFormat.RESET}")
             return
         
         data.state = GameState.TELEPORTING
-        self.teleport_cooldown[kit.get("name")] = current_time
+        self.teleport_cooldown[match_name] = current_time
         
-        self.server.scheduler.run_task(self, lambda: self.teleport_to_match(player, kit, map_data), delay=1)
+        self.server.scheduler.run_task(self, lambda: self.teleport_to_match(player, category, match_name, match_data), delay=1)
     
-    def teleport_to_match(self, player, kit: Dict, map_data: Dict) -> None:
+    def teleport_to_match(self, player, category: str, match_name: str, match_data: Dict) -> None:
         """Teleport player to match"""
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -429,22 +447,22 @@ class FortCore(Plugin):
         player.inventory.clear()
         
         dimension = player.location.dimension
-        x = float(map_data.get("spawn_x", 0.5))
-        y = float(map_data.get("spawn_y", 64.0))
-        z = float(map_data.get("spawn_z", 0.5))
+        spawn = match_data.get("spawn", [0.5, 64.0, 0.5])
+        x, y, z = float(spawn[0]), float(spawn[1]), float(spawn[2])
         
         new_location = Location(dimension, x, y, z)
         player.teleport(new_location)
         
         data.state = GameState.MATCH
-        data.current_kit = kit.get("name")
-        data.current_map = map_data.get("name")
+        data.current_category = category
+        data.current_match = match_name
         
         self.init_rollback(player_uuid)
         
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
-        player.send_message(f"{ColorFormat.AQUA}{map_data.get('name')} {ColorFormat.GRAY}-- By: {map_data.get('creator')}{ColorFormat.RESET}")
-        player.send_message(f"{ColorFormat.YELLOW}{kit.get('name')} {ColorFormat.GRAY}-- By: {kit.get('creator')}{ColorFormat.RESET}")
+        player.send_message(f"{ColorFormat.AQUA}Category: {category}{ColorFormat.RESET}")
+        player.send_message(f"{ColorFormat.YELLOW}Map: {match_data.get('map')}{ColorFormat.RESET}")
+        player.send_message(f"{ColorFormat.GREEN}Kit: {match_data.get('kit')}{ColorFormat.RESET}")
     
     def init_rollback(self, player_uuid: str) -> None:
         """Initialize rollback system"""
@@ -524,9 +542,13 @@ class FortCore(Plugin):
             player.inventory.clear()
             return
         
+        # Strike lightning effect using command instead
         try:
-            dimension = player.location.dimension
-            dimension.strike_lightning(player.location)
+            x, y, z = player.location.x, player.location.y, player.location.z
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f'summon lightning_bolt {x} {y} {z}'
+            )
         except Exception as e:
             self.logger.error(f"Failed to strike lightning: {e}")
         
@@ -650,6 +672,7 @@ class FortCore(Plugin):
         if data.state != GameState.ROLLBACK:
             return
         
+        # FIXED: Store task_id as integer, not Task object
         if player_uuid in self.rollback_tasks:
             try:
                 task_id = self.rollback_tasks[player_uuid]
@@ -668,8 +691,8 @@ class FortCore(Plugin):
         data.rollback_buffer.clear()
         data.pending_rollback_actions.clear()
         data.csv_path = None
-        data.current_kit = None
-        data.current_map = None
+        data.current_category = None
+        data.current_match = None
         
         try:
             player = self.server.get_player(uuid_module.UUID(player_uuid))
