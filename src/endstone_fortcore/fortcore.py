@@ -658,55 +658,33 @@ class FortCore(Plugin):
             self.finish_rollback(player_uuid)
     
     def revert_action(self, action: Dict, player_uuid: str) -> None:
-        """Revert a single action"""
+        """Revert a single action (Bedrock-safe)"""
         try:
             x = int(action["x"])
             y = int(action["y"])
             z = int(action["z"])
             block_type = action["block_type"]
             action_type = action["action"]
-            
-            # Get world name from config (overrides player data for consistency)
-            config_world = self.plugin_config.get("world_name", "overworld")
-            
-            # Get the Level (there's only one level that manages all dimensions)
+
             level = self.server.level
-            
             if not level:
-                self.logger.error("No level found from server")
+                self.logger.error("No level loaded from server")
                 return
-            
-            # Get the dimension from the level
-            try:
-                dimension = level.get_dimension(config_world)
-                self.logger.info(f"Got dimension: {config_world}")
-            except Exception as e:
-                self.logger.error(f"Failed to get dimension '{config_world}': {e}")
-                # Try to use the first available dimension as fallback
-                try:
-                    dimensions = level.dimensions
-                    if dimensions:
-                        dimension = dimensions[0]
-                        self.logger.info(f"Using fallback dimension: {dimension.name}")
-                    else:
-                        self.logger.error("No dimensions available")
-                        return
-                except Exception as e2:
-                    self.logger.error(f"Failed to get fallback dimension: {e2}")
-                    return
-            
-            # Get the block at the coordinates
-            block = dimension.get_block_at(x, y, z)
-            
+
+            # ✅ Bedrock Endstone: use level directly
+            block = level.get_block_at(x, y, z)
+
+            if not block:
+                self.logger.error(f"Block not found at ({x}, {y}, {z})")
+                return
             if action_type == "place":
-                # Player placed this block, so remove it
-                self.logger.info(f"Reverting PLACE: Removing {block_type} at ({x}, {y}, {z})")
+                # Player placed this block → remove it
+                self.logger.info(f"Reverting PLACE at ({x}, {y}, {z})")
                 block.type = "minecraft:air"
             elif action_type == "break":
-                # Player broke this block, so restore it
+                # Player broke this block → restore it
                 self.logger.info(f"Reverting BREAK: Restoring {block_type} at ({x}, {y}, {z})")
                 block.type = block_type
-                
         except Exception as e:
             self.logger.error(f"Error reverting action at ({x}, {y}, {z}): {e}")
     
