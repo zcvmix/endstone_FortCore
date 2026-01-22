@@ -124,13 +124,13 @@ class FortCore(Plugin):
                     actions = self.read_rollback_csv(csv_file)
                     if actions:
                         data.pending_rollback_actions = actions
-                        task_id = self.server.scheduler.run_task(
+                        task = self.server.scheduler.run_task(
                             self, 
                             lambda uid=uuid_str: self.process_rollback_batch(uid),
                             delay=10,
                             period=10
                         )
-                        self.rollback_tasks[uuid_str] = task_id
+                        self.rollback_tasks[uuid_str] = task.task_id
                     else:
                         csv_file.unlink()
                         self.logger.info(f"Deleted invalid rollback file: {csv_file.name}")
@@ -492,6 +492,7 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("break", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
+        self.logger.info(f"Recorded BREAK: {block.type} at ({block.x}, {block.y}, {block.z}) for {player.name}")
     
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent) -> None:
@@ -506,6 +507,7 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
+        self.logger.info(f"Recorded PLACE: {block.type} at ({block.x}, {block.y}, {block.z}) for {player.name}")
     
     def flush_all_buffers(self) -> None:
         """Flush all player buffers to disk"""
@@ -521,11 +523,13 @@ class FortCore(Plugin):
             return
         
         try:
+            actions_count = len(data.rollback_buffer)
             with open(data.csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
                 for action in data.rollback_buffer:
                     writer.writerow([action.timestamp, action.action_type, action.x, action.y, action.z, action.block_type])
             
+            self.logger.info(f"Flushed {actions_count} actions to disk for {player_uuid}")
             data.rollback_buffer.clear()
             data.last_flush = datetime.now().timestamp()
         except Exception as e:
@@ -592,20 +596,26 @@ class FortCore(Plugin):
         data = self.get_player_data(player_uuid)
         
         if data.state == GameState.ROLLBACK:
+            self.logger.info(f"Player {player_uuid} already in rollback state")
             return
         
+        self.logger.info(f"Starting rollback for {player_uuid}")
         data.state = GameState.ROLLBACK
         self.flush_buffer(player_uuid)
         
         if data.csv_path and data.csv_path.exists():
             actions = self.read_rollback_csv(data.csv_path)
+            self.logger.info(f"Found {len(actions)} actions to rollback for {player_uuid}")
             if actions:
                 data.pending_rollback_actions = actions
-                task_id = self.server.scheduler.run_task(self, lambda: self.process_rollback_batch(player_uuid), delay=10, period=10)
-                self.rollback_tasks[player_uuid] = task_id
+                task = self.server.scheduler.run_task(self, lambda: self.process_rollback_batch(player_uuid), delay=10, period=10)
+                self.rollback_tasks[player_uuid] = task.task_id
+                self.logger.info(f"Started rollback task {task.task_id} for {player_uuid}")
             else:
+                self.logger.info(f"No actions to rollback for {player_uuid}")
                 self.finish_rollback(player_uuid)
         else:
+            self.logger.info(f"No CSV file found for {player_uuid}")
             self.finish_rollback(player_uuid)
     
     def read_rollback_csv(self, csv_path: Path) -> List[Dict]:
@@ -626,16 +636,22 @@ class FortCore(Plugin):
         actions = data.pending_rollback_actions
         
         if not actions:
+            self.logger.info(f"Rollback complete for {player_uuid} - no more actions")
             self.finish_rollback(player_uuid)
             return
         
+        processed = 0
         for _ in range(min(2, len(actions))):
             if not actions:
                 break
             action = actions.pop(0)
             self.revert_action(action)
+            processed += 1
+        
+        self.logger.info(f"Processed {processed} rollback actions for {player_uuid}, {len(actions)} remaining")
         
         if not actions:
+            self.logger.info(f"Rollback finished for {player_uuid}")
             self.finish_rollback(player_uuid)
     
     def revert_action(self, action: Dict) -> None:
@@ -653,17 +669,22 @@ class FortCore(Plugin):
                 level = None
             
             if not level:
+                self.logger.error("No level/world found for rollback")
                 return
             
             block = level.get_block_at(x, y, z)
             
             if action_type == "place":
+                # Player placed this block, so remove it
+                self.logger.info(f"Reverting PLACE: Removing {block_type} at ({x}, {y}, {z})")
                 block.type = "minecraft:air"
             elif action_type == "break":
+                # Player broke this block, so restore it
+                self.logger.info(f"Reverting BREAK: Restoring {block_type} at ({x}, {y}, {z})")
                 block.type = block_type
                 
         except Exception as e:
-            self.logger.error(f"Error reverting action: {e}")
+            self.logger.error(f"Error reverting action at ({x}, {y}, {z}): {e}")
     
     def finish_rollback(self, player_uuid: str) -> None:
         """Finish rollback and reset player"""
