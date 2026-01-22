@@ -46,6 +46,7 @@ class PlayerData:
         self.current_category: Optional[str] = None
         self.current_match: Optional[str] = None
         self.pending_rollback_actions: List[Dict] = []
+        self.world_name: Optional[str] = None  # Store world name for rollback
 
 class FortCore(Plugin):
     api_version = "0.5"
@@ -456,6 +457,7 @@ class FortCore(Plugin):
         data.state = GameState.MATCH
         data.current_category = category
         data.current_match = match_name
+        data.world_name = dimension.name  # Store world name
         
         self.init_rollback(player_uuid)
         
@@ -645,7 +647,7 @@ class FortCore(Plugin):
             if not actions:
                 break
             action = actions.pop(0)
-            self.revert_action(action)
+            self.revert_action(action, player_uuid)
             processed += 1
         
         self.logger.info(f"Processed {processed} rollback actions for {player_uuid}, {len(actions)} remaining")
@@ -654,7 +656,7 @@ class FortCore(Plugin):
             self.logger.info(f"Rollback finished for {player_uuid}")
             self.finish_rollback(player_uuid)
     
-    def revert_action(self, action: Dict) -> None:
+    def revert_action(self, action: Dict, player_uuid: str) -> None:
         """Revert a single action"""
         try:
             x = int(action["x"])
@@ -663,13 +665,31 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            try:
-                level = self.server.worlds[0] if self.server.worlds else None
-            except:
-                level = None
+            # Get world name from player data
+            data = self.get_player_data(player_uuid)
+            world_name = data.world_name
+            
+            # Try to get the world/level
+            level = None
+            
+            if world_name:
+                # Try to get world by name
+                try:
+                    level = self.server.get_level(world_name)
+                    self.logger.info(f"Got level by name: {world_name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to get level by name {world_name}: {e}")
             
             if not level:
-                self.logger.error("No level/world found for rollback")
+                # Fallback: get default world
+                try:
+                    level = self.server.get_level()
+                    self.logger.info(f"Got default level")
+                except Exception as e:
+                    self.logger.error(f"Failed to get default level: {e}")
+            
+            if not level:
+                self.logger.error(f"No level/world found for rollback (tried world: {world_name})")
                 return
             
             block = level.get_block_at(x, y, z)
