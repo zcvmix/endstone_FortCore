@@ -152,6 +152,7 @@ class FortCore(Plugin):
         
         if not config_path.exists():
             default_config = {
+                "world_name": "overworld",  # Dimension name for rollback
                 "lobby_spawn": [0.5, 100.0, 0.5],
                 "categories": {
                     "SMP": {
@@ -665,34 +666,37 @@ class FortCore(Plugin):
             block_type = action["block_type"]
             action_type = action["action"]
             
-            # Get world name from player data
-            data = self.get_player_data(player_uuid)
-            world_name = data.world_name
+            # Get world name from config (overrides player data for consistency)
+            config_world = self.plugin_config.get("world_name", "overworld")
             
-            # Try to get the world/level
-            level = None
-            
-            if world_name:
-                # Try to get world by name
-                try:
-                    level = self.server.get_level(world_name)
-                    self.logger.info(f"Got level by name: {world_name}")
-                except Exception as e:
-                    self.logger.error(f"Failed to get level by name {world_name}: {e}")
+            # Get the Level (there's only one level that manages all dimensions)
+            level = self.server.level
             
             if not level:
-                # Fallback: get default world
-                try:
-                    level = self.server.get_level()
-                    self.logger.info(f"Got default level")
-                except Exception as e:
-                    self.logger.error(f"Failed to get default level: {e}")
-            
-            if not level:
-                self.logger.error(f"No level/world found for rollback (tried world: {world_name})")
+                self.logger.error("No level found from server")
                 return
             
-            block = level.get_block_at(x, y, z)
+            # Get the dimension from the level
+            try:
+                dimension = level.get_dimension(config_world)
+                self.logger.info(f"Got dimension: {config_world}")
+            except Exception as e:
+                self.logger.error(f"Failed to get dimension '{config_world}': {e}")
+                # Try to use the first available dimension as fallback
+                try:
+                    dimensions = level.dimensions
+                    if dimensions:
+                        dimension = dimensions[0]
+                        self.logger.info(f"Using fallback dimension: {dimension.name}")
+                    else:
+                        self.logger.error("No dimensions available")
+                        return
+                except Exception as e2:
+                    self.logger.error(f"Failed to get fallback dimension: {e2}")
+                    return
+            
+            # Get the block at the coordinates
+            block = dimension.get_block_at(x, y, z)
             
             if action_type == "place":
                 # Player placed this block, so remove it
