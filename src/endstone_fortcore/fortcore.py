@@ -4,7 +4,8 @@
 from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
 from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent, PlayerRespawnEvent, PlayerDropItemEvent
-from endstone import ColorFormat, GameMode, Location
+from endstone import ColorFormat, GameMode
+from endstone.level import Location  # FIXED: Location is in endstone.level module
 from endstone.form import ActionForm
 from endstone.inventory import ItemStack
 import yaml
