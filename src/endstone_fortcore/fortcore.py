@@ -1,5 +1,5 @@
 # FortCore - High-performance PvP Core Plugin for Endstone Bedrock Server
-# Optimized for zero lag with async operations and efficient rollback system
+# Main plugin file
 
 from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
@@ -9,44 +9,12 @@ from endstone.level import Location
 from endstone.form import ActionForm
 from endstone.inventory import ItemStack
 import json
-import csv
 from pathlib import Path
 from datetime import datetime
-from enum import Enum
 from typing import Dict, List, Optional
 import uuid as uuid_module
 
-class GameState(Enum):
-    """Player game states"""
-    LOBBY = "LOBBY"
-    QUEUE = "QUEUE"
-    TELEPORTING = "TELEPORTING"
-    MATCH = "MATCH"
-    ROLLBACK = "ROLLBACK"
-    END = "END"
-
-class RollbackAction:
-    """Represents a single rollback action"""
-    def __init__(self, action_type: str, x: int, y: int, z: int, block_type: str, timestamp: float):
-        self.action_type = action_type
-        self.x = x
-        self.y = y
-        self.z = z
-        self.block_type = block_type
-        self.timestamp = timestamp
-
-class PlayerData:
-    """Stores player state and rollback data"""
-    def __init__(self, uuid: str):
-        self.uuid = uuid
-        self.state = GameState.LOBBY
-        self.rollback_buffer: List[RollbackAction] = []
-        self.csv_path: Optional[Path] = None
-        self.last_flush = datetime.now().timestamp()
-        self.current_category: Optional[str] = None
-        self.current_match: Optional[str] = None
-        self.pending_rollback_actions: List[Dict] = []
-        self.world_name: Optional[str] = None  # Store world name for rollback
+from endstone_fortcore.rollback import RollbackManager, GameState, PlayerData, RollbackAction
 
 class FortCore(Plugin):
     api_version = "0.5"
@@ -56,10 +24,8 @@ class FortCore(Plugin):
         self.player_data: Dict[str, PlayerData] = {}
         self.plugin_config: Dict = {}
         self.teleport_cooldown: Dict[str, float] = {}
-        self.form_cooldown: Dict[str, float] = {}
-        self.rollback_dir: Path = None
-        self.flush_task = None
-        self.rollback_tasks: Dict[str, int] = {}
+        self.menu_cooldown: Dict[str, float] = {}
+        self.rollback_manager: Optional[RollbackManager] = None
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
@@ -69,90 +35,26 @@ class FortCore(Plugin):
         self.logger.info("FortCore enabled!")
         self.register_events(self)
         
-        self.rollback_dir = Path(self.data_folder) / "rollbacks"
-        self.rollback_dir.mkdir(parents=True, exist_ok=True)
+        rollback_dir = Path(self.data_folder) / "rollbacks"
+        rollback_dir.mkdir(parents=True, exist_ok=True)
         
-        self.server.scheduler.run_task(self, self.resume_incomplete_rollbacks, delay=40)
-        self.flush_task = self.server.scheduler.run_task(self, self.flush_all_buffers, delay=1200, period=1200)
+        self.rollback_manager = RollbackManager(self, rollback_dir)
         
         total_matches = sum(len(matches) for matches in self.plugin_config.get("categories", {}).values())
         self.logger.info(f"Loaded {len(self.plugin_config.get('categories', {}))} categories with {total_matches} total matches")
         
     def on_disable(self) -> None:
         self.logger.info("FortCore disabling...")
-        self.flush_all_buffers()
-        if self.flush_task:
-            try:
-                self.server.scheduler.cancel_task(self.flush_task)
-            except:
-                pass
-        for task_id in list(self.rollback_tasks.values()):
-            try:
-                self.server.scheduler.cancel_task(task_id)
-            except:
-                pass
+        if self.rollback_manager:
+            self.rollback_manager.shutdown()
     
-    def resume_incomplete_rollbacks(self) -> None:
-        """Resume any incomplete rollbacks from server restart"""
-        try:
-            if not self.rollback_dir.exists():
-                return
-            
-            csv_files = list(self.rollback_dir.glob("rollback_*.csv"))
-            if not csv_files:
-                return
-            
-            self.logger.info(f"Found {len(csv_files)} incomplete rollback(s) from previous session")
-            
-            for csv_file in csv_files:
-                try:
-                    uuid_str = csv_file.stem.replace("rollback_", "")
-                    
-                    with open(csv_file, 'r') as f:
-                        lines = f.readlines()
-                    
-                    if len(lines) <= 1:
-                        csv_file.unlink()
-                        self.logger.info(f"Deleted empty rollback file: {csv_file.name}")
-                        continue
-                    
-                    self.logger.info(f"Resuming rollback for player {uuid_str}")
-                    
-                    data = self.get_player_data(uuid_str)
-                    data.csv_path = csv_file
-                    data.state = GameState.ROLLBACK
-                    
-                    actions = self.read_rollback_csv(csv_file)
-                    if actions:
-                        data.pending_rollback_actions = actions
-                        task = self.server.scheduler.run_task(
-                            self, 
-                            lambda uid=uuid_str: self.process_rollback_batch(uid),
-                            delay=10,
-                            period=10
-                        )
-                        self.rollback_tasks[uuid_str] = task.task_id
-                    else:
-                        csv_file.unlink()
-                        self.logger.info(f"Deleted invalid rollback file: {csv_file.name}")
-                        
-                except Exception as e:
-                    self.logger.error(f"Error processing {csv_file.name}: {e}")
-                    try:
-                        csv_file.unlink()
-                    except:
-                        pass
-                        
-        except Exception as e:
-            self.logger.error(f"Error during rollback resume: {e}")
-        
     def load_plugin_config(self) -> None:
         """Load configuration from config.json"""
         config_path = Path(self.data_folder) / "config.json"
         
         if not config_path.exists():
             default_config = {
-                "world_name": "overworld",  # Dimension name for rollback
+                "world_name": "overworld",
                 "lobby_spawn": [0.5, 100.0, 0.5],
                 "categories": {
                     "SMP": {
@@ -199,32 +101,46 @@ class FortCore(Plugin):
             self.player_data[player_uuid] = PlayerData(player_uuid)
         return self.player_data[player_uuid]
     
+    def get_match_player_count(self, match_name: str) -> int:
+        """Get the actual number of players in a specific match"""
+        count = 0
+        for pd in self.player_data.values():
+            if pd.state == GameState.MATCH and pd.current_match == match_name:
+                count += 1
+        return count
+    
+    def get_category_player_count(self, category: str) -> int:
+        """Get the total number of players in a category"""
+        categories = self.plugin_config.get("categories", {})
+        matches = categories.get(category, {})
+        total = 0
+        for match_name in matches.keys():
+            total += self.get_match_player_count(match_name)
+        return total
+    
+    def get_category_max_players(self, category: str) -> int:
+        """Get the total max players for a category"""
+        categories = self.plugin_config.get("categories", {})
+        matches = categories.get(category, {})
+        total = 0
+        for match_data in matches.values():
+            total += match_data.get("max_players", 8)
+        return total
+    
     def reset_player(self, player) -> None:
         """Complete player reset - Returns player to lobby"""
         try:
             player_uuid = str(player.unique_id)
             data = self.get_player_data(player_uuid)
             
+            # Clear current match/category FIRST
+            data.current_category = None
+            data.current_match = None
+            
             if data.state != GameState.ROLLBACK:
-                if player_uuid in self.rollback_tasks:
-                    try:
-                        task_id = self.rollback_tasks[player_uuid]
-                        self.server.scheduler.cancel_task(task_id)
-                        del self.rollback_tasks[player_uuid]
-                    except:
-                        pass
-                
-                if data.csv_path and data.csv_path.exists():
-                    try:
-                        data.csv_path.unlink()
-                    except:
-                        pass
-                
                 data.rollback_buffer.clear()
                 data.pending_rollback_actions.clear()
                 data.csv_path = None
-                data.current_category = None
-                data.current_match = None
             
             data.state = GameState.LOBBY
             player.game_mode = GameMode.SURVIVAL
@@ -255,7 +171,6 @@ class FortCore(Plugin):
             new_location = Location(dimension, x, y, z)
             player.teleport(new_location)
             
-            # Give locked compass using Bedrock command with NBT
             try:
                 self.server.dispatch_command(
                     self.server.command_sender,
@@ -263,7 +178,6 @@ class FortCore(Plugin):
                 )
             except Exception as e:
                 self.logger.error(f"Failed to give locked compass: {e}")
-                # Fallback to regular compass
                 menu_item = ItemStack("minecraft:lodestone_compass", 1)
                 inventory.set_item(8, menu_item)
             
@@ -286,13 +200,6 @@ class FortCore(Plugin):
         
         if data.state == GameState.ROLLBACK:
             self.logger.info(f"Player {player.name} joined during rollback")
-        else:
-            csv_path = self.rollback_dir / f"rollback_{player_uuid}.csv"
-            if csv_path.exists():
-                try:
-                    csv_path.unlink()
-                except:
-                    pass
         
         self.server.scheduler.run_task(self, lambda: self.handle_join_sequence(player), delay=10)
     
@@ -312,7 +219,6 @@ class FortCore(Plugin):
     def on_player_respawn(self, event: PlayerRespawnEvent) -> None:
         """Handle player respawn - teleport to lobby and give compass"""
         player = event.player
-        
         self.server.scheduler.run_task(self, lambda: self.handle_respawn(player), delay=5)
     
     def handle_respawn(self, player) -> None:
@@ -324,7 +230,6 @@ class FortCore(Plugin):
         new_location = Location(dimension, x, y, z)
         player.teleport(new_location)
         
-        # Give locked compass using Bedrock command with NBT
         try:
             self.server.dispatch_command(
                 self.server.command_sender,
@@ -332,7 +237,6 @@ class FortCore(Plugin):
             )
         except Exception as e:
             self.logger.error(f"Failed to give locked compass: {e}")
-            # Fallback to regular compass
             menu_item = ItemStack("minecraft:lodestone_compass", 1)
             player.inventory.set_item(8, menu_item)
     
@@ -342,11 +246,10 @@ class FortCore(Plugin):
         item = event.item_drop.item_stack
         if item and item.type == "minecraft:lodestone_compass":
             event.cancelled = True
-            event.player.send_message(f"{ColorFormat.RED}You cannot drop this item!{ColorFormat.RESET}")
     
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent) -> None:
-        """Handle compass click with cooldown"""
+        """Handle compass click with silent cooldown"""
         player = event.player
         item = player.inventory.item_in_main_hand
         
@@ -355,21 +258,16 @@ class FortCore(Plugin):
             data = self.get_player_data(player_uuid)
             
             if data.state != GameState.LOBBY:
-                if data.state == GameState.ROLLBACK:
-                    player.send_message(f"{ColorFormat.YELLOW}Please wait, cleaning up...{ColorFormat.RESET}")
-                else:
-                    player.send_message(f"{ColorFormat.RED}You must be in the lobby!{ColorFormat.RESET}")
                 return
             
+            # Silent 1 second cooldown
             current_time = datetime.now().timestamp()
-            last_open = self.form_cooldown.get(player_uuid, 0)
-            remaining = 1.0 - (current_time - last_open)
+            last_open = self.menu_cooldown.get(player_uuid, 0)
             
-            if remaining > 0:
-                player.send_message(f"{ColorFormat.RED}Please wait {remaining:.1f}s{ColorFormat.RESET}")
+            if current_time - last_open < 1.0:
                 return
             
-            self.form_cooldown[player_uuid] = current_time
+            self.menu_cooldown[player_uuid] = current_time
             self.open_category_menu(player)
     
     def open_category_menu(self, player) -> None:
@@ -380,10 +278,24 @@ class FortCore(Plugin):
         categories = self.plugin_config.get("categories", {})
         
         for category_name in categories.keys():
+            online_count = self.get_category_player_count(category_name)
+            max_count = self.get_category_max_players(category_name)
+            
+            # Color based on fill percentage
+            percentage = (online_count / max_count * 100) if max_count > 0 else 0
+            if percentage >= 90:
+                color = ColorFormat.RED
+            elif percentage >= 50:
+                color = ColorFormat.GOLD
+            else:
+                color = ColorFormat.GREEN
+            
+            button_text = f"{category_name} {color}[{online_count}/{max_count}]{ColorFormat.RESET}"
+            
             def make_callback(cat):
                 return lambda p: self.open_match_menu(p, cat)
             
-            form.add_button(category_name, on_click=make_callback(category_name))
+            form.add_button(button_text, on_click=make_callback(category_name))
         
         player.send_form(form)
     
@@ -396,10 +308,19 @@ class FortCore(Plugin):
         matches = categories.get(category, {})
         
         for match_name, match_data in matches.items():
-            online_count = sum(1 for pd in self.player_data.values() 
-                             if pd.state == GameState.MATCH and pd.current_match == match_name)
+            online_count = self.get_match_player_count(match_name)
             max_players = match_data.get("max_players", 8)
-            button_text = f"{match_name} [{online_count}/{max_players}]"
+            
+            # Color based on fill percentage
+            percentage = (online_count / max_players * 100) if max_players > 0 else 0
+            if percentage >= 90:
+                color = ColorFormat.RED
+            elif percentage >= 50:
+                color = ColorFormat.GOLD
+            else:
+                color = ColorFormat.GREEN
+            
+            button_text = f"{match_name} {color}[{online_count}/{max_players}]{ColorFormat.RESET}"
             
             def make_callback(cat, match):
                 return lambda p: self.handle_match_select(p, cat, match)
@@ -424,8 +345,7 @@ class FortCore(Plugin):
             player.send_message(f"{ColorFormat.RED}You must be in the lobby!{ColorFormat.RESET}")
             return
         
-        online_count = sum(1 for pd in self.player_data.values() 
-                         if pd.state == GameState.MATCH and pd.current_match == match_name)
+        online_count = self.get_match_player_count(match_name)
         if online_count >= match_data.get("max_players", 8):
             player.send_message(f"{ColorFormat.RED}This match is full!{ColorFormat.RESET}")
             return
@@ -455,32 +375,18 @@ class FortCore(Plugin):
         new_location = Location(dimension, x, y, z)
         player.teleport(new_location)
         
+        # Set state and match info BEFORE rollback init
         data.state = GameState.MATCH
         data.current_category = category
         data.current_match = match_name
-        data.world_name = dimension.name  # Store world name
+        data.world_name = self.plugin_config.get("world_name", "overworld")
         
-        self.init_rollback(player_uuid)
+        self.rollback_manager.init_rollback(player_uuid, data)
         
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.AQUA}Category: {category}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.YELLOW}Map: {match_data.get('map')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.GREEN}Kit: {match_data.get('kit')}{ColorFormat.RESET}")
-    
-    def init_rollback(self, player_uuid: str) -> None:
-        """Initialize rollback system"""
-        data = self.get_player_data(player_uuid)
-        data.rollback_buffer.clear()
-        data.pending_rollback_actions.clear()
-        
-        csv_path = self.rollback_dir / f"rollback_{player_uuid}.csv"
-        data.csv_path = csv_path
-        
-        with open(csv_path, 'w', newline='') as f:
-            writer = csv.writer(f)
-            writer.writerow(["timestamp", "action", "x", "y", "z", "block_type"])
-        
-        data.last_flush = datetime.now().timestamp()
     
     @event_handler
     def on_block_break(self, event: BlockBreakEvent) -> None:
@@ -495,7 +401,6 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("break", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
-        self.logger.info(f"Recorded BREAK: {block.type} at ({block.x}, {block.y}, {block.z}) for {player.name}")
     
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent) -> None:
@@ -510,33 +415,6 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
-        self.logger.info(f"Recorded PLACE: {block.type} at ({block.x}, {block.y}, {block.z}) for {player.name}")
-    
-    def flush_all_buffers(self) -> None:
-        """Flush all player buffers to disk"""
-        for player_uuid, data in self.player_data.items():
-            if data.state == GameState.MATCH and data.rollback_buffer:
-                self.flush_buffer(player_uuid)
-    
-    def flush_buffer(self, player_uuid: str) -> None:
-        """Flush single player buffer to CSV"""
-        data = self.get_player_data(player_uuid)
-        
-        if not data.csv_path or not data.rollback_buffer:
-            return
-        
-        try:
-            actions_count = len(data.rollback_buffer)
-            with open(data.csv_path, 'a', newline='') as f:
-                writer = csv.writer(f)
-                for action in data.rollback_buffer:
-                    writer.writerow([action.timestamp, action.action_type, action.x, action.y, action.z, action.block_type])
-            
-            self.logger.info(f"Flushed {actions_count} actions to disk for {player_uuid}")
-            data.rollback_buffer.clear()
-            data.last_flush = datetime.now().timestamp()
-        except Exception as e:
-            self.logger.error(f"Error flushing buffer: {e}")
     
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent) -> None:
@@ -549,7 +427,6 @@ class FortCore(Plugin):
             player.inventory.clear()
             return
         
-        # Strike lightning effect using command instead
         try:
             x, y, z = player.location.x, player.location.y, player.location.z
             self.server.dispatch_command(
@@ -560,7 +437,7 @@ class FortCore(Plugin):
             self.logger.error(f"Failed to strike lightning: {e}")
         
         player.inventory.clear()
-        self.server.scheduler.run_task(self, lambda: self.start_rollback(player_uuid), delay=5)
+        self.server.scheduler.run_task(self, lambda: self.rollback_manager.start_rollback(player_uuid, data, player), delay=5)
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
@@ -570,8 +447,7 @@ class FortCore(Plugin):
         data = self.get_player_data(player_uuid)
         
         if data.state == GameState.MATCH:
-            self.flush_buffer(player_uuid)
-            self.start_rollback(player_uuid)
+            self.rollback_manager.start_rollback(player_uuid, data, None)
     
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         """Handle /out command"""
@@ -587,165 +463,8 @@ class FortCore(Plugin):
                 sender.send_message("You are not in a match!")
                 return True
             
-            self.flush_buffer(player_uuid)
-            self.start_rollback(player_uuid)
+            self.rollback_manager.start_rollback(player_uuid, data, sender)
             sender.send_message("Leaving match...")
             return True
         
         return False
-    
-    def start_rollback(self, player_uuid: str) -> None:
-        """Start the rollback process"""
-        data = self.get_player_data(player_uuid)
-        
-        if data.state == GameState.ROLLBACK:
-            self.logger.info(f"Player {player_uuid} already in rollback state")
-            return
-        
-        self.logger.info(f"Starting rollback for {player_uuid}")
-        data.state = GameState.ROLLBACK
-        self.flush_buffer(player_uuid)
-        
-        if data.csv_path and data.csv_path.exists():
-            actions = self.read_rollback_csv(data.csv_path)
-            self.logger.info(f"Found {len(actions)} actions to rollback for {player_uuid}")
-            if actions:
-                data.pending_rollback_actions = actions
-                task = self.server.scheduler.run_task(self, lambda: self.process_rollback_batch(player_uuid), delay=10, period=10)
-                self.rollback_tasks[player_uuid] = task.task_id
-                self.logger.info(f"Started rollback task {task.task_id} for {player_uuid}")
-            else:
-                self.logger.info(f"No actions to rollback for {player_uuid}")
-                self.finish_rollback(player_uuid)
-        else:
-            self.logger.info(f"No CSV file found for {player_uuid}")
-            self.finish_rollback(player_uuid)
-    
-    def read_rollback_csv(self, csv_path: Path) -> List[Dict]:
-        """Read rollback actions from CSV in reverse"""
-        actions = []
-        try:
-            with open(csv_path, 'r') as f:
-                reader = csv.DictReader(f)
-                actions = list(reader)
-                actions.reverse()
-        except Exception as e:
-            self.logger.error(f"Error reading CSV: {e}")
-        return actions
-    
-    def process_rollback_batch(self, player_uuid: str) -> None:
-        """Process 2 rollback actions every 0.5 seconds"""
-        data = self.get_player_data(player_uuid)
-        actions = data.pending_rollback_actions
-        
-        if not actions:
-            self.logger.info(f"Rollback complete for {player_uuid} - no more actions")
-            self.finish_rollback(player_uuid)
-            return
-        
-        processed = 0
-        for _ in range(min(2, len(actions))):
-            if not actions:
-                break
-            action = actions.pop(0)
-            self.revert_action(action, player_uuid)
-            processed += 1
-        
-        self.logger.info(f"Processed {processed} rollback actions for {player_uuid}, {len(actions)} remaining")
-        
-        if not actions:
-            self.logger.info(f"Rollback finished for {player_uuid}")
-            self.finish_rollback(player_uuid)
-    
-    def revert_action(self, action: Dict, player_uuid: str) -> None:
-        """Revert a single action"""
-        try:
-            x = int(action["x"])
-            y = int(action["y"])
-            z = int(action["z"])
-            block_type = action["block_type"]
-            action_type = action["action"]
-            
-            # Get world name from config (overrides player data for consistency)
-            config_world = self.plugin_config.get("world_name", "overworld")
-            
-            # Get the Level (there's only one level that manages all dimensions)
-            level = self.server.level
-            
-            if not level:
-                self.logger.error("No level found from server")
-                return
-            
-            # Get the dimension from the level
-            try:
-                dimension = level.get_dimension(config_world)
-                self.logger.info(f"Got dimension: {config_world}")
-            except Exception as e:
-                self.logger.error(f"Failed to get dimension '{config_world}': {e}")
-                # Try to use the first available dimension as fallback
-                try:
-                    dimensions = level.dimensions
-                    if dimensions:
-                        dimension = dimensions[0]
-                        self.logger.info(f"Using fallback dimension: {dimension.name}")
-                    else:
-                        self.logger.error("No dimensions available")
-                        return
-                except Exception as e2:
-                    self.logger.error(f"Failed to get fallback dimension: {e2}")
-                    return
-            
-            # Get the block at the coordinates
-            block = dimension.get_block_at(x, y, z)
-            
-            if action_type == "place":
-                # Player placed this block, so remove it
-                self.logger.info(f"Reverting PLACE: Removing {block_type} at ({x}, {y}, {z})")
-                block.type = "minecraft:air"
-            elif action_type == "break":
-                # Player broke this block, so restore it
-                self.logger.info(f"Reverting BREAK: Restoring {block_type} at ({x}, {y}, {z})")
-                block.type = block_type
-                
-        except Exception as e:
-            self.logger.error(f"Error reverting action at ({x}, {y}, {z}): {e}")
-    
-    def finish_rollback(self, player_uuid: str) -> None:
-        """Finish rollback and reset player"""
-        data = self.get_player_data(player_uuid)
-        
-        if data.state != GameState.ROLLBACK:
-            return
-        
-        # FIXED: Store task_id as integer, not Task object
-        if player_uuid in self.rollback_tasks:
-            try:
-                task_id = self.rollback_tasks[player_uuid]
-                self.server.scheduler.cancel_task(task_id)
-            except Exception as e:
-                self.logger.error(f"Error canceling task: {e}")
-            finally:
-                del self.rollback_tasks[player_uuid]
-        
-        if data.csv_path and data.csv_path.exists():
-            try:
-                data.csv_path.unlink()
-            except Exception as e:
-                self.logger.error(f"Error deleting CSV: {e}")
-        
-        data.rollback_buffer.clear()
-        data.pending_rollback_actions.clear()
-        data.csv_path = None
-        data.current_category = None
-        data.current_match = None
-        
-        try:
-            player = self.server.get_player(uuid_module.UUID(player_uuid))
-        except:
-            player = None
-        
-        if player:
-            self.reset_player(player)
-            player.send_message(f"{ColorFormat.GREEN}Rollback complete! You're back in the lobby.{ColorFormat.RESET}")
-        else:
-            data.state = GameState.LOBBY
