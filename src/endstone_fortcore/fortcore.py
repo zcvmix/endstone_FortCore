@@ -21,14 +21,14 @@ class FortCore(Plugin):
     def __init__(self):
         super().__init__()
         self.player_data: Dict[str, PlayerData] = {}
-        self.plugin_config: Dict = {}
+        self.match_config: Dict = {}
         self.teleport_cooldown: Dict[str, float] = {}
         self.menu_cooldown: Dict[str, float] = {}
         self.rollback_manager: Optional[RollbackManager] = None
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
-        self.load_plugin_config()
+        self.load_match_config()
         
     def on_enable(self) -> None:
         self.logger.info("FortCore enabled!")
@@ -42,15 +42,15 @@ class FortCore(Plugin):
         # Resume incomplete rollbacks from server restart
         self.server.scheduler.run_task(self, lambda: self.rollback_manager.resume_rollbacks(), delay=20)
         
-        total = sum(len(m) for m in self.plugin_config.get("categories", {}).values())
-        self.logger.info(f"Loaded {len(self.plugin_config.get('categories', {}))} categories with {total} matches")
+        total = sum(len(m) for m in self.match_config.get("categories", {}).values())
+        self.logger.info(f"Loaded {len(self.match_config.get('categories', {}))} categories with {total} matches")
         
     def on_disable(self) -> None:
         self.logger.info("FortCore disabling...")
         if self.rollback_manager:
             self.rollback_manager.shutdown()
     
-    def load_plugin_config(self) -> None:
+    def load_match_config(self) -> None:
         """Load configuration from config.json"""
         config_path = Path(self.data_folder) / "config.json"
         
@@ -89,10 +89,10 @@ class FortCore(Plugin):
             config_path.parent.mkdir(parents=True, exist_ok=True)
             with open(config_path, 'w') as f:
                 json.dump(default_config, f, indent=2)
-            self.plugin_config = default_config
+            self.match_config = default_config
         else:
             with open(config_path, 'r') as f:
-                self.plugin_config = json.load(f)
+                self.match_config = json.load(f)
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -107,12 +107,12 @@ class FortCore(Plugin):
     
     def get_category_player_count(self, category: str) -> int:
         """Get the total number of players in a category"""
-        matches = self.plugin_config.get("categories", {}).get(category, {})
+        matches = self.match_config.get("categories", {}).get(category, {})
         return sum(self.get_match_player_count(m) for m in matches.keys())
     
     def get_category_max_players(self, category: str) -> int:
         """Get the total max players for a category"""
-        matches = self.plugin_config.get("categories", {}).get(category, {})
+        matches = self.match_config.get("categories", {}).get(category, {})
         return sum(m.get("max_players", 8) for m in matches.values())
     
     def reset_player(self, player) -> None:
@@ -147,7 +147,7 @@ class FortCore(Plugin):
             except:
                 pass
             
-            lobby = self.plugin_config.get("lobby_spawn", [0.5, 100.0, 0.5])
+            lobby = self.match_config.get("lobby_spawn", [0.5, 100.0, 0.5])
             x, y, z = float(lobby[0]), float(lobby[1]), float(lobby[2])
             
             new_location = Location(player.location.dimension, x, y, z)
@@ -207,7 +207,7 @@ class FortCore(Plugin):
     
     def handle_respawn(self, player) -> None:
         """Handle respawn sequence"""
-        lobby = self.plugin_config.get("lobby_spawn", [0.5, 100.0, 0.5])
+        lobby = self.match_config.get("lobby_spawn", [0.5, 100.0, 0.5])
         x, y, z = float(lobby[0]), float(lobby[1]), float(lobby[2])
         
         new_location = Location(player.location.dimension, x, y, z)
@@ -256,7 +256,7 @@ class FortCore(Plugin):
         form = ActionForm()
         form.title = "FortCore - Select Category"
         
-        categories = self.plugin_config.get("categories", {})
+        categories = self.match_config.get("categories", {})
         
         for category_name in categories.keys():
             online = self.get_category_player_count(category_name)
@@ -279,7 +279,7 @@ class FortCore(Plugin):
         form = ActionForm()
         form.title = f"FortCore - {category}"
         
-        matches = self.plugin_config.get("categories", {}).get(category, {})
+        matches = self.match_config.get("categories", {}).get(category, {})
         
         for match_name, match_data in matches.items():
             online = self.get_match_player_count(match_name)
@@ -302,7 +302,7 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        match_data = self.plugin_config.get("categories", {}).get(category, {}).get(match_name)
+        match_data = self.match_config.get("categories", {}).get(category, {}).get(match_name)
         
         if not match_data:
             player.send_message(f"{ColorFormat.RED}Invalid match!{ColorFormat.RESET}")
@@ -347,7 +347,7 @@ class FortCore(Plugin):
         data.current_match = match_name
         
         # Check if rollback is enabled for this match
-        global_rollback = self.plugin_config.get("rollback_enabled", True)
+        global_rollback = self.match_config.get("rollback_enabled", True)
         match_rollback = match_data.get("rollback_enabled", True)
         
         if global_rollback and match_rollback:
@@ -373,6 +373,13 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("break", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
+        
+        # Track affected area for advanced rollback
+        self.rollback_manager.track_affected_area(data, block.x, block.y, block.z, block.type)
+        
+        # Auto-flush if buffer gets too large (every 50 blocks)
+        if len(data.rollback_buffer) >= 50:
+            self.rollback_manager.flush_buffer(data)
     
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent) -> None:
@@ -387,6 +394,13 @@ class FortCore(Plugin):
         block = event.block
         action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
+        
+        # Track affected area for advanced rollback
+        self.rollback_manager.track_affected_area(data, block.x, block.y, block.z, block.type)
+        
+        # Auto-flush if buffer gets too large (every 50 blocks)
+        if len(data.rollback_buffer) >= 50:
+            self.rollback_manager.flush_buffer(data)
     
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent) -> None:
