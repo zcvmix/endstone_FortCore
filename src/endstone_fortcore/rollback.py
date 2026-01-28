@@ -379,19 +379,19 @@ class RollbackManager:
                 # Player placed this block, remove it
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
-                    f'setblock {x} {y} {z} air 0 destroy'
+                    f'setblock {x} {y} {z} air destroy'
                 )
             elif action_type == "break":
                 # Player broke this block, restore it
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
-                    f'setblock {x} {y} {z} {block_type} 0 replace'
+                    f'setblock {x} {y} {z} {block_type} replace'
                 )
             elif action_type == "cleanup":
                 # Cleanup affected area (force block update)
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
-                    f'setblock {x} {y} {z} air 0 destroy'
+                    f'setblock {x} {y} {z} air destroy'
                 )
                 
         except Exception as e:
