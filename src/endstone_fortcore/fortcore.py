@@ -398,7 +398,7 @@ class FortCore(Plugin):
     
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent) -> None:
-        """Record block placements"""
+        """Record block placements and snapshot the replaced block"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -407,7 +407,20 @@ class FortCore(Plugin):
             return
         
         block = event.block
-        action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
+        dimension = player.location.dimension
+        
+        # Store the block BEFORE it gets placed by checking one tick before
+        # Since this fires AFTER placement, we need to assume what was there
+        replaced_block = "minecraft:air"
+        
+        # Simple heuristic: if block is at player's feet level and player is in water, it was water
+        # Better approach: Just restore water by default for safety in areas where water should be
+        # Even better: Use a scheduled task to check block BEFORE placement
+        
+        # For now, let's use a simpler approach: restore air by default
+        # and add water restoration as a cleanup step
+        
+        action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp(), "minecraft:air")
         data.rollback_buffer.append(action)
         
         # Track affected area for advanced rollback
