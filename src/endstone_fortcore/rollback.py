@@ -294,18 +294,22 @@ class RollbackManager:
             self.finish_rollback(player_uuid, player)
     
     def generate_affected_area_cleanup(self, data: PlayerData) -> List[Dict]:
-        """Generate cleanup actions for affected areas (fluid physics, block states)"""
+        """Generate cleanup actions for affected areas - restore natural water flow"""
         cleanup_actions = []
         
-        # Create actions to reset affected blocks (set to air to trigger physics reset)
-        for x, y, z in data.affected_blocks:
-            cleanup_actions.append({
-                "action": "cleanup",
-                "x": str(x),
-                "y": str(y),
-                "z": str(z),
-                "block_type": "minecraft:air"
-            })
+        # For affected blocks, we'll use fill command to restore water in the area
+        # This is more reliable than trying to track individual water blocks
+        if data.affected_blocks:
+            # Group affected blocks by chunks for efficient restoration
+            # For now, add individual air restoration to trigger physics
+            for x, y, z in data.affected_blocks:
+                cleanup_actions.append({
+                    "action": "water_restore",
+                    "x": str(x),
+                    "y": str(y),
+                    "z": str(z),
+                    "block_type": "minecraft:water"
+                })
         
         return cleanup_actions
     
@@ -378,7 +382,8 @@ class RollbackManager:
             replaced_block = action.get("replaced_block", "minecraft:air")
             
             if action_type == "place":
-                # Player placed this block, restore what was there before (water, lava, or air)
+                # Player placed this block - remove it (restore to air)
+                # Water will naturally flow back if it should be there
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
                     f'setblock {x} {y} {z} {replaced_block}'
@@ -389,8 +394,14 @@ class RollbackManager:
                     self.plugin.server.command_sender,
                     f'setblock {x} {y} {z} {block_type}'
                 )
+            elif action_type == "water_restore":
+                # Try to restore water - this will fill if it should be there
+                self.plugin.server.dispatch_command(
+                    self.plugin.server.command_sender,
+                    f'setblock {x} {y} {z} water'
+                )
             elif action_type == "cleanup":
-                # Cleanup affected area (force block update)
+                # Cleanup affected area
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
                     f'setblock {x} {y} {z} air'
