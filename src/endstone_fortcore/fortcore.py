@@ -101,9 +101,14 @@ class FortCore(Plugin):
         return self.player_data[player_uuid]
     
     def get_match_player_count(self, match_name: str) -> int:
-        """Get the actual number of players in a specific match"""
-        return sum(1 for pd in self.player_data.values() 
-                  if pd.state == GameState.MATCH and pd.current_match == match_name)
+        """Get the actual number of players in a specific match - STRICT checking"""
+        count = 0
+        for player_uuid, pd in self.player_data.items():
+            # Only count if: in MATCH state AND current_match matches AND not None
+            if pd.state == GameState.MATCH and pd.current_match is not None and pd.current_match == match_name:
+                count += 1
+                self.logger.info(f"Counting player {player_uuid} in match {match_name}")
+        return count
     
     def get_category_player_count(self, category: str) -> int:
         """Get the total number of players in a category"""
@@ -177,6 +182,14 @@ class FortCore(Plugin):
         """Handle player join"""
         player = event.player
         player_uuid = str(player.unique_id)
+        
+        # FORCE RESET player data on join to clear ghost counts
+        if player_uuid in self.player_data:
+            old_data = self.player_data[player_uuid]
+            old_data.current_category = None
+            old_data.current_match = None
+            old_data.state = GameState.LOBBY
+        
         data = self.get_player_data(player_uuid)
         
         # Allow join even during rollback
@@ -284,6 +297,8 @@ class FortCore(Plugin):
         for match_name, match_data in matches.items():
             online = self.get_match_player_count(match_name)
             max_p = match_data.get("max_players", 8)
+            
+            self.logger.info(f"Match {match_name}: {online}/{max_p} players")
             
             pct = (online / max_p * 100) if max_p > 0 else 0
             color = ColorFormat.RED if pct >= 90 else (ColorFormat.GOLD if pct >= 50 else ColorFormat.GREEN)
@@ -428,17 +443,21 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
-        """Handle player disconnect"""
+        """Handle player disconnect - FORCE CLEAR player data"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
+        self.logger.info(f"Player {player.name} quitting - state: {data.state}, match: {data.current_match}")
+        
         if data.state == GameState.MATCH and data.rollback_enabled:
             self.rollback_manager.start_rollback(player_uuid, data, None)
-        elif data.state == GameState.MATCH:
+        else:
+            # FORCE CLEAR to prevent ghost counts
             data.current_category = None
             data.current_match = None
             data.state = GameState.LOBBY
+            self.logger.info(f"Cleared player {player_uuid} data on quit")
     
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         """Handle /out command"""
