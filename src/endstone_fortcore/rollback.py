@@ -17,13 +17,14 @@ class GameState(Enum):
 
 class RollbackAction:
     """Represents a single rollback action"""
-    def __init__(self, action_type: str, x: int, y: int, z: int, block_type: str, timestamp: float):
+    def __init__(self, action_type: str, x: int, y: int, z: int, block_type: str, timestamp: float, replaced_block: str = "minecraft:air"):
         self.action_type = action_type
         self.x = x
         self.y = y
         self.z = z
         self.block_type = block_type
         self.timestamp = timestamp
+        self.replaced_block = replaced_block  # What block was there before placement
 
 class PlayerData:
     """Stores player state and rollback data"""
@@ -169,7 +170,7 @@ class RollbackManager:
         
         with open(csv_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(["timestamp", "action", "x", "y", "z", "block_type"])
+            writer.writerow(["timestamp", "action", "x", "y", "z", "block_type", "replaced_block"])
         
         data.last_flush = datetime.now().timestamp()
     
@@ -204,7 +205,7 @@ class RollbackManager:
             with open(data.csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
                 for action in data.rollback_buffer:
-                    writer.writerow([action.timestamp, action.action_type, action.x, action.y, action.z, action.block_type])
+                    writer.writerow([action.timestamp, action.action_type, action.x, action.y, action.z, action.block_type, action.replaced_block])
             
             self.plugin.logger.info(f"Flushed {count} actions for {data.uuid}")
             data.rollback_buffer.clear()
@@ -374,12 +375,13 @@ class RollbackManager:
             z = int(action["z"])
             block_type = action["block_type"]
             action_type = action.get("action", "unknown")
+            replaced_block = action.get("replaced_block", "minecraft:air")
             
             if action_type == "place":
-                # Player placed this block, remove it
+                # Player placed this block, restore what was there before (water, lava, or air)
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
-                    f'setblock {x} {y} {z} air'
+                    f'setblock {x} {y} {z} {replaced_block}'
                 )
             elif action_type == "break":
                 # Player broke this block, restore it
