@@ -1,5 +1,5 @@
 # FortCore - Simple Rollback Manager
-# Basic block tracking and restoration
+# Clean and optimized for production
 
 from enum import Enum
 from typing import Dict, List, Optional
@@ -39,7 +39,7 @@ class PlayerData:
         self.rollback_enabled = True
 
 class RollbackManager:
-    """Simple rollback system - just track breaks and placements"""
+    """Simple and efficient rollback system"""
     
     def __init__(self, plugin, rollback_dir: Path):
         self.plugin = plugin
@@ -47,13 +47,13 @@ class RollbackManager:
         self.rollback_tasks: Dict[str, int] = {}
         self.flush_task = None
         
-        # Smart batching configuration
-        self.SMALL_BATCH = 10     # For < 100 blocks
-        self.MEDIUM_BATCH = 25    # For 100-500 blocks
-        self.LARGE_BATCH = 40     # For 500-1000 blocks
-        self.HUGE_BATCH = 60      # For > 1000 blocks
+        # Batch sizes for different action counts
+        self.SMALL_BATCH = 10     # < 100 blocks
+        self.MEDIUM_BATCH = 25    # 100-500 blocks
+        self.LARGE_BATCH = 40     # 500-1000 blocks
+        self.HUGE_BATCH = 60      # > 1000 blocks
         
-        # Start flush task (every 20 seconds)
+        # Start auto-flush task (every 20 seconds)
         self.flush_task = self.plugin.server.scheduler.run_task(
             self.plugin, 
             self.flush_all_buffers, 
@@ -85,18 +85,16 @@ class RollbackManager:
             if not csv_files:
                 return
             
-            self.plugin.logger.info(f"Found {len(csv_files)} incomplete rollback(s)")
+            self.plugin.logger.info(f"Resuming {len(csv_files)} incomplete rollback(s)")
             
             for csv_file in csv_files:
                 try:
                     uuid_str = csv_file.stem.replace("rollback_", "")
                     
                     with open(csv_file, 'r') as f:
-                        lines = f.readlines()
-                    
-                    if len(lines) <= 1:
-                        csv_file.unlink()
-                        continue
+                        if len(f.readlines()) <= 1:
+                            csv_file.unlink()
+                            continue
                     
                     data = self.plugin.get_player_data(uuid_str)
                     data.csv_path = csv_file
@@ -129,7 +127,7 @@ class RollbackManager:
             self.plugin.logger.error(f"Error during rollback resume: {e}")
     
     def calculate_batch_params(self, total_actions: int) -> tuple:
-        """Calculate optimal batch size and interval"""
+        """Calculate optimal batch size based on action count"""
         if total_actions < 100:
             return self.SMALL_BATCH, 1
         elif total_actions < 500:
@@ -140,7 +138,7 @@ class RollbackManager:
             return self.HUGE_BATCH, 1
     
     def init_rollback(self, player_uuid: str, data: PlayerData) -> None:
-        """Initialize rollback system"""
+        """Initialize rollback system for a player"""
         data.rollback_buffer.clear()
         data.pending_rollback_actions.clear()
         data.rollback_enabled = True
@@ -156,17 +154,16 @@ class RollbackManager:
     
     def flush_all_buffers(self) -> None:
         """Flush all player buffers to disk"""
-        for player_uuid, data in self.plugin.player_data.items():
+        for data in self.plugin.player_data.values():
             if data.state == GameState.MATCH and data.rollback_buffer and data.rollback_enabled:
                 self.flush_buffer(data)
     
     def flush_buffer(self, data: PlayerData) -> None:
-        """Flush single player buffer to CSV"""
+        """Flush player buffer to CSV file"""
         if not data.csv_path or not data.rollback_buffer:
             return
         
         try:
-            count = len(data.rollback_buffer)
             with open(data.csv_path, 'a', newline='') as f:
                 writer = csv.writer(f)
                 for action in data.rollback_buffer:
@@ -178,51 +175,20 @@ class RollbackManager:
             self.plugin.logger.error(f"Error flushing buffer: {e}")
     
     def start_rollback(self, player_uuid: str, data: PlayerData, player) -> None:
-        """Start the rollback process - only if match is empty"""
+        """Start rollback process - always rollback individual player actions"""
         if data.state == GameState.ROLLBACK:
             return
         
-        # Store match info before clearing
+        # Store info for logging
         match_name = data.current_match
         category = data.current_category
         
         # Clear match/category IMMEDIATELY
         data.current_category = None
         data.current_match = None
-        
-        # Check if there are other players in the same match (use both category and match)
-        other_players = sum(1 for pd in self.plugin.player_data.values() 
-                          if pd.uuid != player_uuid and 
-                             pd.state == GameState.MATCH and 
-                             pd.current_category == category and 
-                             pd.current_match == match_name)
-        
-        if other_players > 0:
-            # Match is not empty, skip rollback
-            self.plugin.logger.info(f"Skipping rollback - {other_players} player(s) still in {category}:{match_name}")
-            
-            if data.csv_path and data.csv_path.exists():
-                try:
-                    data.csv_path.unlink()
-                except:
-                    pass
-            
-            data.rollback_buffer.clear()
-            data.pending_rollback_actions.clear()
-            data.csv_path = None
-            
-            if player:
-                self.plugin.reset_player(player)
-            else:
-                data.state = GameState.LOBBY
-            
-            return
-        
-        # Match is empty, proceed with rollback
-        self.plugin.logger.info(f"Starting rollback for {category}:{match_name}")
         data.state = GameState.ROLLBACK
         
-        # Force flush any remaining buffer
+        # Force flush remaining buffer
         self.flush_buffer(data)
         
         if data.csv_path and data.csv_path.exists():
@@ -233,9 +199,6 @@ class RollbackManager:
                 data.pending_rollback_actions = actions
                 batch_size, interval = self.calculate_batch_params(total_actions)
                 
-                if player and total_actions > 500:
-                    player.send_message(f"{ColorFormat.YELLOW}Rolling back {total_actions} blocks...{ColorFormat.RESET}")
-                
                 task = self.plugin.server.scheduler.run_task(
                     self.plugin, 
                     lambda: self.process_rollback_batch(player_uuid), 
@@ -243,6 +206,7 @@ class RollbackManager:
                     period=interval
                 )
                 self.rollback_tasks[player_uuid] = task.task_id
+                self.plugin.logger.info(f"Started rollback for {player_uuid} in {category}:{match_name} ({total_actions} blocks)")
             else:
                 self.finish_rollback(player_uuid, player)
         else:
@@ -261,7 +225,7 @@ class RollbackManager:
         return actions
     
     def process_rollback_batch(self, player_uuid: str) -> None:
-        """Process rollback batch"""
+        """Process batch of rollback actions"""
         data = self.plugin.get_player_data(player_uuid)
         
         if data.state != GameState.ROLLBACK:
@@ -302,7 +266,7 @@ class RollbackManager:
             self.finish_rollback(player_uuid, player)
     
     def revert_action(self, action: Dict) -> None:
-        """Revert a single action - handles liquids properly"""
+        """Revert a single block action"""
         try:
             x = int(action["x"])
             y = int(action["y"])
@@ -314,51 +278,52 @@ class RollbackManager:
             is_liquid = block_type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]
             
             if action_type == "place":
-                # Player placed this block - remove it
+                # Remove placed block
                 self.plugin.server.dispatch_command(
                     self.plugin.server.command_sender,
                     f'setblock {x} {y} {z} air'
                 )
-            elif action_type == "break":
-                # Player broke this block - restore it (non-liquids only)
-                if not is_liquid:
-                    self.plugin.server.dispatch_command(
-                        self.plugin.server.command_sender,
-                        f'setblock {x} {y} {z} {block_type}'
-                    )
+            elif action_type == "break" and not is_liquid:
+                # Restore broken block (skip liquids)
+                self.plugin.server.dispatch_command(
+                    self.plugin.server.command_sender,
+                    f'setblock {x} {y} {z} {block_type}'
+                )
                 
         except Exception as e:
-            self.plugin.logger.error(f"Error reverting: {e}")
+            self.plugin.logger.error(f"Error reverting block: {e}")
     
     def finish_rollback(self, player_uuid: str, player) -> None:
-        """Finish rollback and reset player"""
+        """Finish rollback and cleanup"""
         data = self.plugin.get_player_data(player_uuid)
         
         if data.state != GameState.ROLLBACK:
             return
         
+        # Cancel rollback task
         if player_uuid in self.rollback_tasks:
             try:
-                task_id = self.rollback_tasks[player_uuid]
-                self.plugin.server.scheduler.cancel_task(task_id)
+                self.plugin.server.scheduler.cancel_task(self.rollback_tasks[player_uuid])
                 del self.rollback_tasks[player_uuid]
             except:
                 pass
         
+        # Delete CSV file
         if data.csv_path and data.csv_path.exists():
             try:
                 data.csv_path.unlink()
             except:
                 pass
         
+        # Clear all data
         data.rollback_buffer.clear()
         data.pending_rollback_actions.clear()
         data.csv_path = None
         data.current_category = None
         data.current_match = None
         
+        # Reset player if online (silent)
         if player:
             self.plugin.reset_player(player)
-            player.send_message(f"{ColorFormat.GREEN}Rollback complete!{ColorFormat.RESET}")
         else:
             data.state = GameState.LOBBY
