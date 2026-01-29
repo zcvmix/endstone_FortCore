@@ -183,11 +183,11 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent) -> None:
-        """Handle player join"""
+        """Handle player join - reset all data"""
         player = event.player
         player_uuid = str(player.unique_id)
         
-        # FORCE RESET player data on join to clear ghost counts
+        # Force clear any existing data
         if player_uuid in self.player_data:
             old_data = self.player_data[player_uuid]
             old_data.current_category = None
@@ -198,7 +198,7 @@ class FortCore(Plugin):
         
         # Allow join even during rollback
         if data.state == GameState.ROLLBACK:
-            self.logger.info(f"Player {player.name} joined during rollback - allowing join")
+            self.logger.info(f"Player {player.name} joined during rollback")
         
         self.server.scheduler.run_task(self, lambda: self.handle_join_sequence(player), delay=10)
     
@@ -269,7 +269,7 @@ class FortCore(Plugin):
             self.open_category_menu(player)
     
     def open_category_menu(self, player) -> None:
-        """Open category selection menu"""
+        """Open category selection menu with back button"""
         form = ActionForm()
         form.title = "FortCore - Select Category"
         
@@ -289,10 +289,15 @@ class FortCore(Plugin):
             
             form.add_button(button_text, on_click=make_callback(category_name))
         
+        # Handle X button close
+        def on_close(p):
+            pass  # Do nothing, just close the menu
+        
+        form.on_close = on_close
         player.send_form(form)
     
     def open_match_menu(self, player, category: str) -> None:
-        """Open match selection menu"""
+        """Open match selection menu with back button"""
         form = ActionForm()
         form.title = f"FortCore - {category}"
         
@@ -312,6 +317,11 @@ class FortCore(Plugin):
             
             form.add_button(button_text, on_click=make_callback(category, match_name))
         
+        # Handle X button close - go back to category menu
+        def on_close(p):
+            self.open_category_menu(p)
+        
+        form.on_close = on_close
         player.send_form(form)
     
     def handle_match_select(self, player, category: str, match_name: str) -> None:
@@ -455,21 +465,18 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
-        """Handle player disconnect - FORCE CLEAR player data"""
+        """Handle player disconnect - always rollback"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        self.logger.info(f"Player {player.name} quitting - state: {data.state}, match: {data.current_match}")
-        
         if data.state == GameState.MATCH and data.rollback_enabled:
             self.rollback_manager.start_rollback(player_uuid, data, None)
         else:
-            # FORCE CLEAR to prevent ghost counts
+            # Clear data
             data.current_category = None
             data.current_match = None
             data.state = GameState.LOBBY
-            self.logger.info(f"Cleared player {player_uuid} data on quit")
     
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
         """Handle /out command"""
