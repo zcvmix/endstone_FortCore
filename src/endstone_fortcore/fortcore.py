@@ -100,20 +100,24 @@ class FortCore(Plugin):
             self.player_data[player_uuid] = PlayerData(player_uuid)
         return self.player_data[player_uuid]
     
-    def get_match_player_count(self, match_name: str) -> int:
-        """Get the actual number of players in a specific match - STRICT checking"""
+    def get_match_player_count(self, category: str, match_name: str) -> int:
+        """Get the actual number of players in a specific match - STRICT checking with category"""
         count = 0
         for player_uuid, pd in self.player_data.items():
-            # Only count if: in MATCH state AND current_match matches AND not None
-            if pd.state == GameState.MATCH and pd.current_match is not None and pd.current_match == match_name:
+            # Only count if: in MATCH state AND both category and match name match
+            if (pd.state == GameState.MATCH and 
+                pd.current_category == category and 
+                pd.current_match == match_name):
                 count += 1
-                self.logger.info(f"Counting player {player_uuid} in match {match_name}")
         return count
     
     def get_category_player_count(self, category: str) -> int:
         """Get the total number of players in a category"""
         matches = self.match_config.get("categories", {}).get(category, {})
-        return sum(self.get_match_player_count(m) for m in matches.keys())
+        total = 0
+        for match_name in matches.keys():
+            total += self.get_match_player_count(category, match_name)
+        return total
     
     def get_category_max_players(self, category: str) -> int:
         """Get the total max players for a category"""
@@ -295,10 +299,8 @@ class FortCore(Plugin):
         matches = self.match_config.get("categories", {}).get(category, {})
         
         for match_name, match_data in matches.items():
-            online = self.get_match_player_count(match_name)
+            online = self.get_match_player_count(category, match_name)
             max_p = match_data.get("max_players", 8)
-            
-            self.logger.info(f"Match {match_name}: {online}/{max_p} players")
             
             pct = (online / max_p * 100) if max_p > 0 else 0
             color = ColorFormat.RED if pct >= 90 else (ColorFormat.GOLD if pct >= 50 else ColorFormat.GREEN)
@@ -327,19 +329,19 @@ class FortCore(Plugin):
             player.send_message(f"{ColorFormat.RED}You must be in lobby!{ColorFormat.RESET}")
             return
         
-        online = self.get_match_player_count(match_name)
+        online = self.get_match_player_count(category, match_name)
         if online >= match_data.get("max_players", 8):
             player.send_message(f"{ColorFormat.RED}Match is full!{ColorFormat.RESET}")
             return
         
         current_time = datetime.now().timestamp()
-        last_tp = self.teleport_cooldown.get(match_name, 0)
+        last_tp = self.teleport_cooldown.get(f"{category}:{match_name}", 0)
         if current_time - last_tp < 5.0:
             player.send_message(f"{ColorFormat.RED}Someone just teleported! Wait...{ColorFormat.RESET}")
             return
         
         data.state = GameState.TELEPORTING
-        self.teleport_cooldown[match_name] = current_time
+        self.teleport_cooldown[f"{category}:{match_name}"] = current_time
         
         self.server.scheduler.run_task(self, lambda: self.teleport_to_match(player, category, match_name, match_data), delay=1)
     
@@ -377,7 +379,7 @@ class FortCore(Plugin):
     
     @event_handler
     def on_block_break(self, event: BlockBreakEvent) -> None:
-        """Record block breaks"""
+        """Record block breaks (skip liquids - they can't be broken by hand)"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -386,19 +388,21 @@ class FortCore(Plugin):
             return
         
         block = event.block
+        
+        # Skip recording liquid breaks (liquids can't be broken by hand)
+        if block.type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]:
+            return
+        
         action = RollbackAction("break", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
         
-        # Track affected area for advanced rollback
-        self.rollback_manager.track_affected_area(data, block.x, block.y, block.z, block.type)
-        
-        # Auto-flush if buffer gets too large (every 50 blocks)
+        # Auto-flush if buffer gets too large
         if len(data.rollback_buffer) >= 50:
             self.rollback_manager.flush_buffer(data)
     
     @event_handler
     def on_block_place(self, event: BlockPlaceEvent) -> None:
-        """Record block placements and snapshot the replaced block"""
+        """Record block placements"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -407,26 +411,21 @@ class FortCore(Plugin):
             return
         
         block = event.block
-        dimension = player.location.dimension
+        item = player.inventory.item_in_main_hand
         
-        # Store the block BEFORE it gets placed by checking one tick before
-        # Since this fires AFTER placement, we need to assume what was there
-        replaced_block = "minecraft:air"
+        # Detect if player is placing liquid from bucket
+        is_liquid_placement = False
+        if item and item.type in ["minecraft:water_bucket", "minecraft:lava_bucket"]:
+            is_liquid_placement = True
         
-        # Simple heuristic: if block is at player's feet level and player is in water, it was water
-        # Better approach: Just restore water by default for safety in areas where water should be
-        # Even better: Use a scheduled task to check block BEFORE placement
+        # Also check if the placed block itself is liquid
+        if block.type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]:
+            is_liquid_placement = True
         
-        # For now, let's use a simpler approach: restore air by default
-        # and add water restoration as a cleanup step
-        
-        action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp(), "minecraft:air")
+        action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
         
-        # Track affected area for advanced rollback
-        self.rollback_manager.track_affected_area(data, block.x, block.y, block.z, block.type)
-        
-        # Auto-flush if buffer gets too large (every 50 blocks)
+        # Auto-flush if buffer gets too large
         if len(data.rollback_buffer) >= 50:
             self.rollback_manager.flush_buffer(data)
     
