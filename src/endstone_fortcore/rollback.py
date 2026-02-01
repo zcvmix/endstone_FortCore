@@ -37,6 +37,7 @@ class PlayerData:
         self.current_match: Optional[str] = None
         self.pending_rollback_actions: List[Dict] = []
         self.rollback_enabled = True
+        self.waiting_respawn = False
 
 class RollbackManager:
     """Simple and efficient rollback system"""
@@ -267,7 +268,7 @@ class RollbackManager:
             self.finish_rollback(player_uuid, player)
     
     def revert_action(self, action: Dict) -> None:
-        """Revert a single block action - handles unloaded chunks gracefully"""
+        """Revert a single block action"""
         try:
             x = int(action["x"])
             y = int(action["y"])
@@ -275,36 +276,21 @@ class RollbackManager:
             block_type = action["block_type"]
             action_type = action.get("action", "unknown")
             
-            # Check if block is a liquid
             is_liquid = block_type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]
             
             if action_type == "place":
-                # Remove placed block (including liquid sources)
-                try:
-                    # Use execute positioned to avoid "no targets matched" when chunk unloaded
-                    self.plugin.server.dispatch_command(
-                        self.plugin.server.command_sender,
-                        f'execute positioned {x} {y} {z} run setblock ~ ~ ~ air'
-                    )
-                except:
-                    # Silently fail - chunk might be unloaded
-                    pass
-                        
+                self.plugin.server.dispatch_command(
+                    self.plugin.server.command_sender,
+                    f'setblock {x} {y} {z} air'
+                )
             elif action_type == "break" and not is_liquid:
-                # Restore broken block (skip liquids)
-                try:
-                    # Use execute positioned to avoid "no targets matched" when chunk unloaded
-                    self.plugin.server.dispatch_command(
-                        self.plugin.server.command_sender,
-                        f'execute positioned {x} {y} {z} run setblock ~ ~ ~ {block_type}'
-                    )
-                except:
-                    # Silently fail - chunk might be unloaded
-                    pass
+                self.plugin.server.dispatch_command(
+                    self.plugin.server.command_sender,
+                    f'setblock {x} {y} {z} {block_type}'
+                )
                 
-        except Exception as e:
-            # Log unexpected errors only
-            self.plugin.logger.error(f"Unexpected error reverting block: {e}")
+        except:
+            pass
     
     def finish_rollback(self, player_uuid: str, player) -> None:
         """Finish rollback and cleanup"""
