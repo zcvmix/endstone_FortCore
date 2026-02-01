@@ -1,9 +1,9 @@
 # FortCore - High-performance PvP Core Plugin for Endstone Bedrock Server
-# Optimized for low-end servers and devices with smart rollback batching
+# Production-ready with match tracking and spawn teleport
 
 from endstone.plugin import Plugin
 from endstone.command import Command, CommandSender
-from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent, PlayerRespawnEvent, PlayerDropItemEvent
+from endstone.event import event_handler, PlayerJoinEvent, PlayerDeathEvent, PlayerQuitEvent, PlayerInteractEvent, BlockBreakEvent, BlockPlaceEvent, PlayerRespawnEvent, PlayerDropItemEvent, PlayerMoveEvent
 from endstone import ColorFormat, GameMode
 from endstone.level import Location
 from endstone.form import ActionForm
@@ -18,17 +18,35 @@ from endstone_fortcore.rollback import RollbackManager, GameState, PlayerData, R
 class FortCore(Plugin):
     api_version = "0.5"
     
+    commands = {
+        "spawn": {
+            "description": "Return to lobby (hold still for 5 seconds)",
+            "usages": ["/spawn"],
+            "permissions": ["fortcore.command.spawn"]
+        }
+    }
+    
+    permissions = {
+        "fortcore.command.spawn": {
+            "description": "Allow returning to lobby",
+            "default": True
+        }
+    }
+    
     def __init__(self):
         super().__init__()
         self.player_data: Dict[str, PlayerData] = {}
         self.match_config: Dict = {}
+        self.match_stats: Dict = {}
         self.teleport_cooldown: Dict[str, float] = {}
         self.menu_cooldown: Dict[str, float] = {}
+        self.spawn_requests: Dict[str, Dict] = {}
         self.rollback_manager: Optional[RollbackManager] = None
         
     def on_load(self) -> None:
         self.logger.info("FortCore loading...")
         self.load_match_config()
+        self.load_match_stats()
         
     def on_enable(self) -> None:
         self.logger.info("FortCore enabled!")
@@ -39,8 +57,11 @@ class FortCore(Plugin):
         
         self.rollback_manager = RollbackManager(self, rollback_dir)
         
-        # Resume incomplete rollbacks from server restart
+        # Resume incomplete rollbacks
         self.server.scheduler.run_task(self, lambda: self.rollback_manager.resume_rollbacks(), delay=20)
+        
+        # Check spawn requests every second
+        self.server.scheduler.run_task(self, self.check_spawn_requests, delay=20, period=20)
         
         total = sum(len(m) for m in self.match_config.get("categories", {}).values())
         self.logger.info(f"Loaded {len(self.match_config.get('categories', {}))} categories with {total} matches")
@@ -49,6 +70,7 @@ class FortCore(Plugin):
         self.logger.info("FortCore disabling...")
         if self.rollback_manager:
             self.rollback_manager.shutdown()
+        self.save_match_stats()
     
     def load_match_config(self) -> None:
         """Load configuration from config.json"""
@@ -66,22 +88,6 @@ class FortCore(Plugin):
                             "max_players": 8,
                             "spawn": [100.5, 64.0, 100.5],
                             "rollback_enabled": True
-                        },
-                        "NetheriteSMP": {
-                            "map": "Netherite Arena",
-                            "kit": "Netherite Kit",
-                            "max_players": 8,
-                            "spawn": [200.5, 64.0, 200.5],
-                            "rollback_enabled": True
-                        }
-                    },
-                    "PvP": {
-                        "Knight1v1": {
-                            "map": "Knight Arena",
-                            "kit": "Knight Kit",
-                            "max_players": 2,
-                            "spawn": [300.5, 64.0, 300.5],
-                            "rollback_enabled": False
                         }
                     }
                 }
@@ -93,6 +99,43 @@ class FortCore(Plugin):
         else:
             with open(config_path, 'r') as f:
                 self.match_config = json.load(f)
+    
+    def load_match_stats(self) -> None:
+        """Load match statistics from match_stats.json"""
+        stats_path = Path(self.data_folder) / "match_stats.json"
+        
+        if not stats_path.exists():
+            self.match_stats = {}
+        else:
+            with open(stats_path, 'r') as f:
+                self.match_stats = json.load(f)
+    
+    def save_match_stats(self) -> None:
+        """Save match statistics to match_stats.json"""
+        stats_path = Path(self.data_folder) / "match_stats.json"
+        with open(stats_path, 'w') as f:
+            json.dump(self.match_stats, f, indent=2)
+    
+    def get_player_match_count(self, player_uuid: str) -> int:
+        """Get total matches played by player"""
+        return self.match_stats.get(player_uuid, {}).get("total_matches", 0)
+    
+    def increment_player_match_count(self, player_uuid: str) -> int:
+        """Increment and return player's match count"""
+        if player_uuid not in self.match_stats:
+            self.match_stats[player_uuid] = {"total_matches": 0}
+        
+        self.match_stats[player_uuid]["total_matches"] += 1
+        self.save_match_stats()
+        return self.match_stats[player_uuid]["total_matches"]
+    
+    def get_ordinal(self, n: int) -> str:
+        """Convert number to ordinal (1st, 2nd, 3rd, etc.)"""
+        if 10 <= n % 100 <= 20:
+            suffix = 'th'
+        else:
+            suffix = {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')
+        return f"{n}{suffix}"
                 
     def get_player_data(self, player_uuid: str) -> PlayerData:
         """Get or create player data"""
@@ -101,10 +144,9 @@ class FortCore(Plugin):
         return self.player_data[player_uuid]
     
     def get_match_player_count(self, category: str, match_name: str) -> int:
-        """Get the actual number of players in a specific match - STRICT checking with category"""
+        """Get actual number of players in a specific match"""
         count = 0
-        for player_uuid, pd in self.player_data.items():
-            # Only count if: in MATCH state AND both category and match name match
+        for pd in self.player_data.values():
             if (pd.state == GameState.MATCH and 
                 pd.current_category == category and 
                 pd.current_match == match_name):
@@ -112,7 +154,7 @@ class FortCore(Plugin):
         return count
     
     def get_category_player_count(self, category: str) -> int:
-        """Get the total number of players in a category"""
+        """Get total number of players in a category"""
         matches = self.match_config.get("categories", {}).get(category, {})
         total = 0
         for match_name in matches.keys():
@@ -120,17 +162,17 @@ class FortCore(Plugin):
         return total
     
     def get_category_max_players(self, category: str) -> int:
-        """Get the total max players for a category"""
+        """Get total max players for a category"""
         matches = self.match_config.get("categories", {}).get(category, {})
         return sum(m.get("max_players", 8) for m in matches.values())
     
     def reset_player(self, player) -> None:
-        """Complete player reset - Returns player to lobby"""
+        """Complete player reset"""
         try:
             player_uuid = str(player.unique_id)
             data = self.get_player_data(player_uuid)
             
-            # Clear current match/category FIRST
+            # Clear current match/category
             data.current_category = None
             data.current_match = None
             data.state = GameState.LOBBY
@@ -183,11 +225,11 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_join(self, event: PlayerJoinEvent) -> None:
-        """Handle player join - reset all data"""
+        """Handle player join"""
         player = event.player
         player_uuid = str(player.unique_id)
         
-        # Force clear any existing data
+        # Force clear existing data
         if player_uuid in self.player_data:
             old_data = self.player_data[player_uuid]
             old_data.current_category = None
@@ -196,7 +238,6 @@ class FortCore(Plugin):
         
         data = self.get_player_data(player_uuid)
         
-        # Allow join even during rollback
         if data.state == GameState.ROLLBACK:
             self.logger.info(f"Player {player.name} joined during rollback")
         
@@ -207,12 +248,11 @@ class FortCore(Plugin):
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
-        # Always reset player on join
         self.reset_player(player)
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         
         if data.state == GameState.ROLLBACK:
-            player.send_message(f"{ColorFormat.YELLOW}Cleaning up your previous session in background...{ColorFormat.RESET}")
+            player.send_message(f"{ColorFormat.YELLOW}Cleaning up your previous session...{ColorFormat.RESET}")
         
         player.send_message(f"{ColorFormat.YELLOW}Right-click the compass to select a match!{ColorFormat.RESET}")
     
@@ -247,7 +287,7 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_interact(self, event: PlayerInteractEvent) -> None:
-        """Handle compass click with silent cooldown"""
+        """Handle compass click"""
         player = event.player
         item = player.inventory.item_in_main_hand
         
@@ -258,7 +298,6 @@ class FortCore(Plugin):
             if data.state != GameState.LOBBY:
                 return
             
-            # Silent 1 second cooldown
             current_time = datetime.now().timestamp()
             last_open = self.menu_cooldown.get(player_uuid, 0)
             
@@ -269,7 +308,7 @@ class FortCore(Plugin):
             self.open_category_menu(player)
     
     def open_category_menu(self, player) -> None:
-        """Open category selection menu with back button"""
+        """Open category selection menu"""
         form = ActionForm()
         form.title = "FortCore - Select Category"
         
@@ -289,15 +328,11 @@ class FortCore(Plugin):
             
             form.add_button(button_text, on_click=make_callback(category_name))
         
-        # Handle X button close
-        def on_close(p):
-            pass  # Do nothing, just close the menu
-        
-        form.on_close = on_close
+        form.on_close = lambda p: None
         player.send_form(form)
     
     def open_match_menu(self, player, category: str) -> None:
-        """Open match selection menu with back button"""
+        """Open match selection menu"""
         form = ActionForm()
         form.title = f"FortCore - {category}"
         
@@ -317,11 +352,7 @@ class FortCore(Plugin):
             
             form.add_button(button_text, on_click=make_callback(category, match_name))
         
-        # Handle X button close - go back to category menu
-        def on_close(p):
-            self.open_category_menu(p)
-        
-        form.on_close = on_close
+        form.on_close = lambda p: self.open_category_menu(p)
         player.send_form(form)
     
     def handle_match_select(self, player, category: str, match_name: str) -> None:
@@ -356,7 +387,7 @@ class FortCore(Plugin):
         self.server.scheduler.run_task(self, lambda: self.teleport_to_match(player, category, match_name, match_data), delay=1)
     
     def teleport_to_match(self, player, category: str, match_name: str, match_data: Dict) -> None:
-        """Teleport player to match and start recording"""
+        """Teleport player to match"""
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
@@ -368,12 +399,16 @@ class FortCore(Plugin):
         new_location = Location(player.location.dimension, x, y, z)
         player.teleport(new_location)
         
-        # Set state FIRST before init_rollback
+        # Set state FIRST
         data.state = GameState.MATCH
         data.current_category = category
         data.current_match = match_name
         
-        # Check if rollback is enabled for this match
+        # Increment match count
+        match_count = self.increment_player_match_count(player_uuid)
+        ordinal = self.get_ordinal(match_count)
+        
+        # Check rollback settings
         global_rollback = self.match_config.get("rollback_enabled", True)
         match_rollback = match_data.get("rollback_enabled", True)
         
@@ -382,14 +417,26 @@ class FortCore(Plugin):
         else:
             data.rollback_enabled = False
         
+        # Get current player count
+        total_players = self.get_match_player_count(category, match_name)
+        
+        # Broadcast join message
+        if total_players == 1:
+            self.server.broadcast_message(f"{ColorFormat.GREEN}{player.name}{ColorFormat.YELLOW} joined {ColorFormat.AQUA}{match_name}{ColorFormat.RESET}")
+        else:
+            others = total_players - 1
+            self.server.broadcast_message(f"{ColorFormat.GREEN}{player.name}{ColorFormat.YELLOW} and {ColorFormat.GOLD}{others}{ColorFormat.YELLOW} other{'s' if others > 1 else ''} joined {ColorFormat.AQUA}{match_name}{ColorFormat.RESET}")
+        
+        # Send player info
         player.send_message(f"{ColorFormat.GOLD}=== FortCore ==={ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.AQUA}Category: {category}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.YELLOW}Map: {match_data.get('map')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.GREEN}Kit: {match_data.get('kit')}{ColorFormat.RESET}")
+        player.send_message(f"{ColorFormat.LIGHT_PURPLE}This is your {ordinal} match!{ColorFormat.RESET}")
     
     @event_handler
     def on_block_break(self, event: BlockBreakEvent) -> None:
-        """Record block breaks (skip liquids - they can't be broken by hand)"""
+        """Record block breaks"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -399,14 +446,13 @@ class FortCore(Plugin):
         
         block = event.block
         
-        # Skip recording liquid breaks (liquids can't be broken by hand)
+        # Skip liquids
         if block.type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]:
             return
         
         action = RollbackAction("break", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
         
-        # Auto-flush if buffer gets too large
         if len(data.rollback_buffer) >= 50:
             self.rollback_manager.flush_buffer(data)
     
@@ -421,21 +467,9 @@ class FortCore(Plugin):
             return
         
         block = event.block
-        item = player.inventory.item_in_main_hand
-        
-        # Detect if player is placing liquid from bucket
-        is_liquid_placement = False
-        if item and item.type in ["minecraft:water_bucket", "minecraft:lava_bucket"]:
-            is_liquid_placement = True
-        
-        # Also check if the placed block itself is liquid
-        if block.type in ["minecraft:water", "minecraft:lava", "minecraft:flowing_water", "minecraft:flowing_lava"]:
-            is_liquid_placement = True
-        
         action = RollbackAction("place", block.x, block.y, block.z, block.type, datetime.now().timestamp())
         data.rollback_buffer.append(action)
         
-        # Auto-flush if buffer gets too large
         if len(data.rollback_buffer) >= 50:
             self.rollback_manager.flush_buffer(data)
     
@@ -450,9 +484,11 @@ class FortCore(Plugin):
             player.inventory.clear()
             return
         
+        # Strike lightning at death location
         try:
             x, y, z = player.location.x, player.location.y, player.location.z
-            self.server.dispatch_command(self.server.command_sender, f'summon lightning_bolt {x} {y} {z}')
+            # Use execute command to avoid target errors
+            self.server.dispatch_command(self.server.command_sender, f'execute @a[name="{player.name}"] ~~~ summon lightning_bolt ~~~')
         except:
             pass
         
@@ -465,22 +501,61 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
-        """Handle player disconnect - always rollback"""
+        """Handle player disconnect"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
         
+        # Cancel spawn request if exists
+        if player_uuid in self.spawn_requests:
+            del self.spawn_requests[player_uuid]
+        
         if data.state == GameState.MATCH and data.rollback_enabled:
             self.rollback_manager.start_rollback(player_uuid, data, None)
         else:
-            # Clear data
             data.current_category = None
             data.current_match = None
             data.state = GameState.LOBBY
     
+    @event_handler
+    def on_player_move(self, event: PlayerMoveEvent) -> None:
+        """Handle player movement - check spawn requests"""
+        player = event.player
+        player_uuid = str(player.unique_id)
+        
+        if player_uuid in self.spawn_requests:
+            # Player moved, cancel spawn request
+            del self.spawn_requests[player_uuid]
+            player.send_message(f"{ColorFormat.RED}Spawn cancelled - you moved!{ColorFormat.RESET}")
+    
+    def check_spawn_requests(self) -> None:
+        """Check spawn requests every second"""
+        current_time = datetime.now().timestamp()
+        completed = []
+        
+        for player_uuid, request in self.spawn_requests.items():
+            if current_time - request["start_time"] >= 5.0:
+                # 5 seconds passed, teleport player
+                completed.append(player_uuid)
+                
+                try:
+                    player = request["player"]
+                    data = self.get_player_data(player_uuid)
+                    
+                    if data.rollback_enabled:
+                        self.rollback_manager.start_rollback(player_uuid, data, player)
+                    else:
+                        self.reset_player(player)
+                except Exception as e:
+                    self.logger.error(f"Error completing spawn request: {e}")
+        
+        # Remove completed requests
+        for player_uuid in completed:
+            del self.spawn_requests[player_uuid]
+    
     def on_command(self, sender: CommandSender, command: Command, args: list[str]) -> bool:
-        """Handle /out command"""
-        if command.name == "out":
+        """Handle /spawn command"""
+        if command.name == "spawn":
             if not hasattr(sender, "unique_id"):
                 sender.send_message("Only players can use this.")
                 return True
@@ -492,12 +567,13 @@ class FortCore(Plugin):
                 sender.send_message("You are not in a match!")
                 return True
             
-            if data.rollback_enabled:
-                self.rollback_manager.start_rollback(player_uuid, data, sender)
-                sender.send_message("Leaving match...")
-            else:
-                self.reset_player(sender)
-                sender.send_message("Returned to lobby!")
+            # Start spawn request
+            self.spawn_requests[player_uuid] = {
+                "player": sender,
+                "start_time": datetime.now().timestamp()
+            }
+            
+            sender.send_message(f"{ColorFormat.YELLOW}Don't move for 5 seconds to return to spawn...{ColorFormat.RESET}")
             return True
         
         return False
