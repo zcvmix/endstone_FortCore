@@ -258,8 +258,22 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_respawn(self, event: PlayerRespawnEvent) -> None:
-        """Handle player respawn"""
+        """Handle player respawn - THIS is where we reset dead players"""
         player = event.player
+        player_uuid = str(player.unique_id)
+        data = self.get_player_data(player_uuid)
+        
+        # Player just respawned after death in a match - now safe to run commands
+        if data.waiting_respawn:
+            data.waiting_respawn = False
+            # Now player exists again, safe to teleport/give items/apply effects
+            if data.rollback_enabled:
+                self.server.scheduler.run_task(self, lambda: self.rollback_manager.start_rollback(player_uuid, data, player), delay=5)
+            else:
+                self.server.scheduler.run_task(self, lambda: self.reset_player(player), delay=5)
+            return
+        
+        # Normal respawn (not from match death) - just give compass
         self.server.scheduler.run_task(self, lambda: self.handle_respawn(player), delay=5)
     
     def handle_respawn(self, player) -> None:
@@ -387,19 +401,46 @@ class FortCore(Plugin):
         self.server.scheduler.run_task(self, lambda: self.teleport_to_match(player, category, match_name, match_data), delay=1)
     
     def teleport_to_match(self, player, category: str, match_name: str, match_data: Dict) -> None:
-        """Teleport player to match"""
+        """Teleport player to match - loads chunk first, then teleports"""
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
-        
-        player.inventory.clear()
         
         spawn = match_data.get("spawn", [0.5, 64.0, 0.5])
         x, y, z = float(spawn[0]), float(spawn[1]), float(spawn[2])
         
+        # Load the chunk at spawn location first using tickingarea
+        chunk_x = int(x) >> 4
+        chunk_z = int(z) >> 4
+        block_x = chunk_x * 16
+        block_z = chunk_z * 16
+        
+        try:
+            # Create a ticking area to force the chunk to load
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f'tickingarea add {block_x} 0 {block_z} {block_x + 15} 320 {block_z + 15} {match_name}_load'
+            )
+        except:
+            pass
+        
+        # Wait for chunk to load then teleport
+        self.server.scheduler.run_task(self, lambda: self.finish_teleport(player, category, match_name, match_data, x, y, z), delay=30)
+    
+    def finish_teleport(self, player, category: str, match_name: str, match_data: Dict, x: float, y: float, z: float) -> None:
+        """Actually teleport the player after chunk is loaded"""
+        player_uuid = str(player.unique_id)
+        data = self.get_player_data(player_uuid)
+        
+        # Check player is still valid and in TELEPORTING state
+        if data.state != GameState.TELEPORTING:
+            return
+        
+        player.inventory.clear()
+        
         new_location = Location(player.location.dimension, x, y, z)
         player.teleport(new_location)
         
-        # Set state FIRST
+        # Set state AFTER teleport succeeds
         data.state = GameState.MATCH
         data.current_category = category
         data.current_match = match_name
@@ -417,7 +458,16 @@ class FortCore(Plugin):
         else:
             data.rollback_enabled = False
         
-        # Get current player count
+        # Remove ticking area after teleport
+        try:
+            self.server.dispatch_command(
+                self.server.command_sender,
+                f'tickingarea remove {match_name}_load'
+            )
+        except:
+            pass
+        
+        # Get current player count for broadcast
         total_players = self.get_match_player_count(category, match_name)
         
         # Broadcast join message
@@ -433,9 +483,6 @@ class FortCore(Plugin):
         player.send_message(f"{ColorFormat.YELLOW}Map: {match_data.get('map')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.GREEN}Kit: {match_data.get('kit')}{ColorFormat.RESET}")
         player.send_message(f"{ColorFormat.LIGHT_PURPLE}This is your {ordinal} match!{ColorFormat.RESET}")
-    
-    @event_handler
-    def on_block_break(self, event: BlockBreakEvent) -> None:
         """Record block breaks"""
         player = event.player
         player_uuid = str(player.unique_id)
@@ -475,7 +522,7 @@ class FortCore(Plugin):
     
     @event_handler
     def on_player_death(self, event: PlayerDeathEvent) -> None:
-        """Handle player death"""
+        """Handle player death - wait for respawn before doing anything"""
         player = event.player
         player_uuid = str(player.unique_id)
         data = self.get_player_data(player_uuid)
@@ -484,20 +531,18 @@ class FortCore(Plugin):
             player.inventory.clear()
             return
         
-        # Strike lightning at death location
+        # Strike lightning at death location using coordinates directly
         try:
             x, y, z = player.location.x, player.location.y, player.location.z
-            # Use execute command to avoid target errors
-            self.server.dispatch_command(self.server.command_sender, f'execute @a[name="{player.name}"] ~~~ summon lightning_bolt ~~~')
+            self.server.dispatch_command(self.server.command_sender, f'summon lightning_bolt {x} {y} {z}')
         except:
             pass
         
         player.inventory.clear()
         
-        if data.rollback_enabled:
-            self.server.scheduler.run_task(self, lambda: self.rollback_manager.start_rollback(player_uuid, data, player), delay=5)
-        else:
-            self.server.scheduler.run_task(self, lambda: self.reset_player(player), delay=5)
+        # Mark player as waiting for respawn - actual reset happens in on_player_respawn
+        data.state = GameState.ROLLBACK
+        data.waiting_respawn = True
     
     @event_handler
     def on_player_quit(self, event: PlayerQuitEvent) -> None:
